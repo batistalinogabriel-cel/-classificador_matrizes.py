@@ -1,0 +1,17 @@
+# Modelos grandes (baixados pelo instalador)
+piper_voices/
+vosk_models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.wav
+*.log

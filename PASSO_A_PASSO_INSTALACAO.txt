@@ -1,0 +1,154 @@
+================================================================================
+  CLASSIFICADOR DE MATRIZES — PASSO A PASSO DE INSTALAÇÃO
+================================================================================
+
+Arquivos deste pacote:
+  classificador_matrizes.py      Programa principal (Windows + Ubuntu)
+  INSTALAR_TUDO.ps1              Instalador automático Windows
+  INSTALAR_TUDO.sh               Instalador automático Linux
+  README.md                      Documentação completa (GitHub)
+  PASSO_A_PASSO_INSTALACAO.txt   Este guia
+  .gitignore                     Ignora modelos grandes no Git
+
+================================================================================
+WINDOWS — INSTALAÇÃO RÁPIDA
+================================================================================
+
+1. Instale o Python
+   https://www.python.org/downloads/
+   Marque: "Add python.exe to PATH"
+   Feche e abra de novo o PowerShell.
+
+2. Coloque TODOS os arquivos na mesma pasta, por exemplo:
+   C:\Users\SEU_NOME\Downloads\classificador-matrizes\
+
+3. Abra o PowerShell nessa pasta
+   (Explorador → botão direito → "Abrir no Terminal")
+
+4. Execute o instalador:
+
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   .\INSTALAR_TUDO.ps1
+
+5. Quando terminar:
+
+   python classificador_matrizes.py
+
+================================================================================
+UBUNTU / LINUX — INSTALAÇÃO RÁPIDA
+================================================================================
+
+1. Abra o terminal na pasta do projeto.
+
+2. Execute:
+
+   chmod +x INSTALAR_TUDO.sh
+   ./INSTALAR_TUDO.sh
+
+3. Rode o programa:
+
+   python3 classificador_matrizes.py
+
+================================================================================
+INSTALAÇÃO MANUAL (SE O SCRIPT FALHAR)
+================================================================================
+
+WINDOWS — bibliotecas:
+  python -m pip install --upgrade pip
+  python -m pip install numpy vosk sounddevice soundfile piper-tts
+
+LINUX — bibliotecas:
+  sudo apt install -y python3 python3-pip libportaudio2
+  python3 -m pip install numpy vosk sounddevice soundfile piper-tts
+
+MODELOS (Windows PowerShell):
+  cd pasta_do_programa
+  mkdir piper_voices, vosk_models -Force
+
+  cd piper_voices
+  Invoke-WebRequest -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx" -OutFile "pt_BR-faber-medium.onnx"
+  Invoke-WebRequest -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json" -OutFile "pt_BR-faber-medium.onnx.json"
+
+  cd ..\vosk_models
+  Invoke-WebRequest -Uri "https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip" -OutFile "vosk-model-small-pt-0.3.zip"
+  Expand-Archive -Path "vosk-model-small-pt-0.3.zip" -DestinationPath "." -Force
+
+MODELOS (Linux):
+  mkdir -p piper_voices vosk_models
+  cd piper_voices
+  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx
+  wget https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json
+  cd ../vosk_models
+  wget https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip
+  unzip vosk-model-small-pt-0.3.zip
+
+================================================================================
+ESTRUTURA FINAL ESPERADA
+================================================================================
+
+  classificador-matrizes/
+  ├── classificador_matrizes.py
+  ├── INSTALAR_TUDO.ps1
+  ├── INSTALAR_TUDO.sh
+  ├── README.md
+  ├── piper_voices/
+  │   ├── pt_BR-faber-medium.onnx
+  │   └── pt_BR-faber-medium.onnx.json
+  └── vosk_models/
+      └── vosk-model-small-pt-0.3/
+          ├── am/
+          ├── conf/
+          └── ...
+
+================================================================================
+COMO PUBLICAR NO GITHUB
+================================================================================
+
+1. Crie conta em https://github.com
+2. New repository → nome: classificador-matrizes
+3. NÃO envie as pastas piper_voices/ e vosk_models/ (são grandes)
+4. Envie apenas:
+     classificador_matrizes.py
+     INSTALAR_TUDO.ps1
+     INSTALAR_TUDO.sh
+     PASSO_A_PASSO_INSTALACAO.txt
+     README.md
+     .gitignore
+
+Comandos (na pasta do projeto):
+
+  git init
+  git add classificador_matrizes.py INSTALAR_TUDO.ps1 INSTALAR_TUDO.sh PASSO_A_PASSO_INSTALACAO.txt README.md .gitignore
+  git commit -m "Versão multiplataforma Windows + Ubuntu"
+  git branch -M main
+  git remote add origin https://github.com/SEU_USUARIO/classificador-matrizes.git
+  git push -u origin main
+
+Ou use GitHub Desktop / arraste os arquivos pelo site.
+
+No README, troque SEU_USUARIO pelo seu nome de usuário do GitHub.
+
+Quem baixar o repositório só precisa rodar o INSTALAR_TUDO — ele baixa
+os modelos automaticamente.
+
+================================================================================
+PROBLEMAS COMUNS
+================================================================================
+
+"python" / "py" não reconhecido
+  → Reinstale Python marcando "Add python.exe to PATH"
+
+Modelo Piper não encontrado
+  → Rode o instalador ou baixe os .onnx manualmente em piper_voices/
+
+Modelo Vosk não encontrado
+  → Extraia o ZIP em vosk_models/vosk-model-small-pt-0.3/
+
+Microfone indisponível
+  → Windows: permita microfone em Configurações → Privacidade
+  → Linux: sudo apt install libportaudio2
+
+Avisos vermelhos no VS Code
+  → Ctrl+Shift+P → Python: Select Interpreter
+
+================================================================================
