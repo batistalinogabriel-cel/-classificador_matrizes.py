@@ -214,24 +214,3 @@ Comandos de voz:
 
 Este projeto é educacional. Use e adapte livremente.
 
----
-
-## Publicar no GitHub (para quem for compartilhar)
-
-1. Crie conta em https://github.com  
-2. **New repository** → nome: `classificador-matrizes`  
-3. **Não** marque “Add README” se já tiver este arquivo  
-4. Envie os arquivos:
-
-```bash
-git init
-git add classificador_matrizes.py INSTALAR_TUDO.ps1 INSTALAR_TUDO.sh PASSO_A_PASSO_INSTALACAO.txt README.md
-git commit -m "Versão multiplataforma Windows + Ubuntu"
-git branch -M main
-git remote add origin https://github.com/SEU_USUARIO/classificador-matrizes.git
-git push -u origin main
-```
-
-Ou use o **GitHub Desktop** / arraste os arquivos pelo site.
-
-**Não envie** as pastas `piper_voices/` e `vosk_models/` (arquivos grandes). O instalador baixa para cada usuário.
