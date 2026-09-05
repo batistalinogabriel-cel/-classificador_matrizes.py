@@ -36,7 +36,7 @@ Estudantes de álgebra linear, professores, pessoas com deficiência visual ou d
 
 ## Equipe  (GRUPO-4)
 
-<img align="right" height="500x" width="500px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
+<img align="right" height="450x" width="450px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
 
 | Profile | Integrante 
 | :------ | :--------- 
