@@ -7,7 +7,7 @@
 
 # **CLASSIFICADOR AUTOMÁTICO DE MATRIZES**
 
-<img align="right" height="260px" width="245px" alt="matriz" src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Abacus.png"/>
+<img align="right" height="260px" width="260px" alt="matriz" src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Abacus.png"/>
 
 **Sobre o projeto:**
 
@@ -34,17 +34,15 @@ Estudantes de álgebra linear, professores, pessoas com deficiência visual ou d
 <br>
 <br>
 
-## Equipe  (GRUPO-4)
+## Equipe
 
-<img align="right" height="450x" width="450px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
+<img align="right" height="120px" width="120px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
 
-| Profile | Integrante 
-| :------ | :--------- 
-| [![Gabriel Batista Lino](https://github.com/batistalinogabriel-cel.png?size=100)](https://github.com/batistalinogabriel-cel "Gabriel Batista Lino no GitHub") | **Gabriel Batista Lino** 
-|[![Alexandre Augusto Heredia](https://github.com/AlexandreAHeredia.png?size=100)](https://github.com/AlexandreAHeredia "Alexandre Augusto Heredia no GitHub")| **Alexandre Augusto Heredia**   
-|[![Rafael de Souza Schmoeller](https://github.com/rafaelsouzasch-stack.png?size=100)](https://github.com/rafaelsouzasch-stack "GRafael de Souza Schmoeller") | **Rafael de Souza Schmoeller**  
-|[![Rafael Victor Zanette Nunes](https://github.com/xnunes-ia.png?size=100)](https://github.com/xnunes-ia "Rafael Victor Zanette Nunes no GitHub") | **Rafael Victor Zanette Nunes**
-|[![Felipe Gabriel Vacari](https://github.com/FelipeVacar1.png?size=100)](https://github.com/FelipeVacar1 "Felipe Gabriel Vacari no GitHub")| **Felipe Gabriel Vacari**      
+| Profile | Integrante | Responsabilidades |
+| :------ | :--------- | :---------------- |
+| [![Gabriel Batista Lino](https://github.com/batistalinogabriel-cel.png?size=60)](https://github.com/batistalinogabriel-cel "Gabriel Batista Lino no GitHub") | **Gabriel Batista Lino** | Desenvolvimento, voz, microfone e multiplataforma |
+
+> Se houver mais integrantes, inclua linhas na tabela no mesmo formato.
 
 ## Objetivos
 
@@ -58,6 +56,7 @@ Desenvolver um classificador interativo de matrizes, com saída por voz e entrad
 * Calcular a transposta e verificar simetria, antissimetria e normalidade
 * Oferecer feedback falado (Piper) de todas as classificações e resultados
 * Permitir preenchimento da matriz por voz (Vosk) com comandos em português
+* Evitar eco do sintetizador (microfone mudo durante a fala + modo fone)
 * Garantir funcionamento multiplataforma (Windows + Linux) com o mesmo código
 * Facilitar a instalação por meio de scripts automáticos
 
@@ -117,29 +116,74 @@ Os instaladores baixam automaticamente:
 
 ### Menu principal
 
-| Tecla | Ação |
-|:-----:|:-----|
+| Tecla / voz | Ação |
+|:-----------:|:-----|
 | `1` | Informar matriz e analisar (classificações 1 a 11) |
 | `2` | Transformar matriz (transposta, simetria, normalidade) |
 | `3` | Sair |
 | `M` | Ativar / desativar microfone |
+| `F` ou falar **fone** | Alternar **modo fone** (ATIVADO / DESATIVADO) |
+| `R` ou falar **repetir** | Repetir o último áudio (após análise/transformação) |
+
+### Modo fone e anti-eco
+
+| Modo fone | Comportamento |
+|:----------|:--------------|
+| **DESATIVADO** (padrão, alto-falante) | Microfone mudo enquanto o Piper fala; pausa maior após a fala; filtro de eco residual ativo |
+| **ATIVADO** (fone de ouvido) | Microfone também mudo durante a fala do Piper (zero eco); pausa curta após a fala; **sem** filtro de eco residual (não rejeita a sua fala real) |
+
+Em **ambos** os modos o microfone **não reconhece** enquanto o Piper está falando.  
+Fale os comandos **nas pausas**, depois que a voz terminar.
 
 ### Entrada por voz (exemplos)
 
 | Fala | Resultado |
 |:-----|:----------|
 | `um espaço dois espaço três` | `1 2 3` |
-| `dois por três` | `2 3` |
 | `um dois três excluir` | `1 2` (apaga o último) |
 | `um dois três pronto` | `1 2 3` + Enter |
+| `fone` | Alterna modo fone |
+| `repetir` | Repete o último áudio (quando a opção estiver disponível) |
 
-**Comandos de voz:** zero–nove · menos · vírgula · espaço / por · apagar / excluir · pronto / confirmar / enter
+### Vocabulário de voz
+
+**Números e edição**
+
+| Fala | Tecla |
+|:-----|:------|
+| zero … nove | `0` … `9` |
+| menos | `-` |
+| vírgula / ponto | `,` |
+| espaço | espaço |
+| apagar / excluir / voltar | backspace |
+| pronto / confirmar / enter | Enter |
+
+**Controle do programa**
+
+| Fala | Ação |
+|:-----|:-----|
+| fone / fones / efe | Alterna modo fone (`F`) |
+| repetir / repete / repita | Repete áudio (`R`) |
+
+**Operadores (vocabulário extra)**
+
+| Fala | Símbolo |
+|:-----|:--------|
+| mais / soma / somar | `+` |
+| menos / subtrai / subtrair | `-` |
+| vezes / multiplica / multiplicar | `*` |
+| dividido / divide / dividir | `/` |
+| igual / resultado | `=` |
+
+Palavras de preenchimento como *por favor*, *então*, *agora*, *ok* são **ignoradas** e não viram tecla.
 
 ### Dicas
 
-* Fale **depois** que o Piper terminar (o microfone ignora o áudio enquanto a voz está ativa)
-* Após uma análise, pressione **R** para repetir o áudio
+* Fale **depois** que o Piper terminar (o microfone fica mudo durante a voz)
+* Use **fone de ouvido** + tecla **F** (ou diga **fone**) para o modo mais confortável
+* Após uma análise, pressione **R** ou diga **repetir** para ouvir de novo
 * É possível reutilizar a **transposta** da última matriz informada
+* Nos menus, a narração não interrompe a si mesma (`falar_somente`), deixando a navegação mais fluida
 
 ## Estrutura do projeto
 
@@ -192,6 +236,8 @@ VOSK_MODEL_PATH     → pasta do modelo Vosk
 | Modelo Piper não encontrado | Rode o instalador ou baixe os `.onnx` manualmente |
 | Modelo Vosk não encontrado | Extraia o ZIP em `vosk_models/vosk-model-small-pt-0.3/` |
 | Microfone indisponível | Permita o microfone no sistema; no Linux: `sudo apt install libportaudio2` |
+| Eco / comandos duplicados no alto-falante | Deixe **modo fone DESATIVADO** ou use fone + **F** / diga **fone** |
+| Comando de voz ignorado | Espere o Piper terminar e fale na pausa |
 | Avisos no VS Code (Pylance) | `Ctrl+Shift+P` → **Python: Select Interpreter** |
 
 ## Metodologia
@@ -200,7 +246,13 @@ O programa segue o fluxo:
 
 **Entrada (teclado ou voz) → Validação → Classificação (NumPy) → Saída escrita + falada (Piper)**
 
-O microfone permanece aberto enquanto estiver ativo; o áudio é descartado enquanto o Piper fala, evitando que a própria voz do programa seja interpretada como comando.
+Controle de áudio e microfone:
+
+1. Enquanto o **Piper fala**, o microfone fica **mudo** (não envia áudio ao Vosk)
+2. Após a fala, há uma pausa curta (**modo fone**) ou maior (**alto-falante**)
+3. No alto-falante, um filtro adicional evita tratar o eco residual como comando
+4. No **modo fone**, esse filtro de texto é desligado para não rejeitar a fala real do usuário
+5. Frases reconhecidas são confirmadas uma vez; teclas virtuais da voz não disparam feedback digitado de novo
 
 ## Créditos
 
@@ -208,24 +260,26 @@ O microfone permanece aberto enquanto estiver ativo; o áudio é descartado enqu
 * [Vosk](https://github.com/alphacep/vosk-api) — reconhecimento de fala offline  
 * [NumPy](https://numpy.org/) — operações com matrizes  
 
+<img align="left" height="80px" width="80px" alt="ok" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExaWZ3czZ2b2Jnd2xqZ3JzODYxZm12dXNseXF6dzdhYmFpYnd1emZhdiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/lqLda21veZpX5t4Ymb/giphy.gif"/>
 
 <br>
 <br>
 <br>
 
-<img align="left" height="94px" width="94px" alt="Warpnet" src="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExaWZ3czZ2b2Jnd2xqZ3JzODYxZm12dXNseXF6dzdhYmFpYnd1emZhdiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/lqLda21veZpX5t4Ymb/giphy.gif"/>
+## Status
 
-
-
-<div align="center">
-</div>
-
-##    Status 
 ---
 
 **Concluído / em uso**
 
-Versão multiplataforma (Windows + Ubuntu) com classificação 1–15, voz Piper, microfone Vosk e instaladores automáticos.
+Versão multiplataforma (Windows + Ubuntu) com:
+
+* classificações 1–15  
+* voz Piper + microfone Vosk  
+* modo fone (tecla **F** ou comando de voz **fone**)  
+* anti-eco (microfone mudo durante a fala)  
+* comandos de voz ampliados (repetir, operadores, etc.)  
+* instaladores automáticos  
 
 ---
 
