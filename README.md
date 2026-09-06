@@ -7,7 +7,7 @@
 
 # **CLASSIFICADOR AUTOMÁTICO DE MATRIZES**
 
-<img align="right" height="260px" width="260px" alt="matriz" src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Abacus.png"/>
+<img align="right" height="260px" width="240px" alt="matriz" src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Abacus.png"/>
 
 **Sobre o projeto:**
 
@@ -36,13 +36,15 @@ Estudantes de álgebra linear, professores, pessoas com deficiência visual ou d
 
 ## Equipe
 
-<img align="right" height="120px" width="120px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
+<img align="right" height="450px" width="450px" alt="dev" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExajA3cnB5YTZ0MzFoMHBzamZoM2pud3N5NWp4YjJ1cmV2bjV4NXc0ZSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/UQVIaWYcyR8pBIDrev/giphy.gif"/>
 
-| Profile | Integrante | Responsabilidades |
-| :------ | :--------- | :---------------- |
-| [![Gabriel Batista Lino](https://github.com/batistalinogabriel-cel.png?size=60)](https://github.com/batistalinogabriel-cel "Gabriel Batista Lino no GitHub") | **Gabriel Batista Lino** | Desenvolvimento, voz, microfone e multiplataforma |
-
-> Se houver mais integrantes, inclua linhas na tabela no mesmo formato.
+| Profile | Integrante 
+| :------ | :--------- 
+| [![Gabriel Batista Lino](https://github.com/batistalinogabriel-cel.png?size=100)](https://github.com/batistalinogabriel-cel "Gabriel Batista Lino no GitHub") | **Gabriel Batista Lino** 
+|[![Alexandre Augusto Heredia](https://github.com/AlexandreAHeredia.png?size=100)](https://github.com/AlexandreAHeredia "Alexandre Augusto Heredia no GitHub")| **Alexandre Augusto Heredia**   
+|[![Rafael de Souza Schmoeller](https://github.com/rafaelsouzasch-stack.png?size=100)](https://github.com/rafaelsouzasch-stack "GRafael de Souza Schmoeller") | **Rafael de Souza Schmoeller**  
+|[![Rafael Victor Zanette Nunes](https://github.com/xnunes-ia.png?size=100)](https://github.com/xnunes-ia "Rafael Victor Zanette Nunes no GitHub") | **Rafael Victor Zanette Nunes**
+|[![Felipe Gabriel Vacari](https://github.com/FelipeVacar1.png?size=100)](https://github.com/FelipeVacar1 "Felipe Gabriel Vacari no GitHub")| **Felipe Gabriel Vacari**   
 
 ## Objetivos
 
@@ -260,14 +262,17 @@ Controle de áudio e microfone:
 * [Vosk](https://github.com/alphacep/vosk-api) — reconhecimento de fala offline  
 * [NumPy](https://numpy.org/) — operações com matrizes  
 
-<img align="left" height="80px" width="80px" alt="ok" src="https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExaWZ3czZ2b2Jnd2xqZ3JzODYxZm12dXNseXF6dzdhYmFpYnd1emZhdiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/lqLda21veZpX5t4Ymb/giphy.gif"/>
 
 <br>
 <br>
 <br>
 
-## Status
+<img align="left" height="94px" width="94px" alt="Warpnet" src="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExaWZ3czZ2b2Jnd2xqZ3JzODYxZm12dXNseXF6dzdhYmFpYnd1emZhdiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/lqLda21veZpX5t4Ymb/giphy.gif"/>
 
+<div align="center">
+</div>
+
+##    Status 
 ---
 
 **Concluído / em uso**
