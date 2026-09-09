@@ -192,6 +192,7 @@ Palavras de preenchimento como *por favor*, *então*, *agora*, *ok* são **ignor
 ```text
 classificador-matrizes/
 │
+├──Classificador_de_Matrizes_Acessivel1.pptx.zip    #vídeo explicativo
 ├── classificador_matrizes.py      # Programa principal
 ├── INSTALAR_TUDO.ps1              # Instalador Windows
 ├── INSTALAR_TUDO.sh               # Instalador Linux
