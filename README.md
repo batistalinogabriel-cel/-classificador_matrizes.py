@@ -192,13 +192,13 @@ Palavras de preenchimento como *por favor*, *então*, *agora*, *ok* são **ignor
 ```text
 classificador-matrizes/
 │
-├──Classificador_de_Matrizes_Acessivel1.pptx.zip    #vídeo explicativo
 ├── classificador_matrizes.py      # Programa principal
 ├── INSTALAR_TUDO.ps1              # Instalador Windows
 ├── INSTALAR_TUDO.sh               # Instalador Linux
 ├── PASSO_A_PASSO_INSTALACAO.txt   # Guia detalhado
 ├── README.md                      # Documentação principal
 ├── .gitignore                     # Ignora modelos grandes
+├── video_explicativo.pptx.zip     # vídeo explicativo
 │
 ├── piper_voices/                  # (baixado pelo instalador)
 │   ├── pt_BR-faber-medium.onnx
