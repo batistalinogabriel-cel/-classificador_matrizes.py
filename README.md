@@ -291,10 +291,7 @@ Controle de áudio e microfone:
 <div align="center">
 </div>
 
-##    Status 
----
-## Status
-
+##          Status 
 ---
 
 **Concluído / em uso**
