@@ -118,74 +118,85 @@ Os instaladores baixam automaticamente:
 
 ### Menu principal
 
-| Tecla / voz | Ação |
-|:-----------:|:-----|
+| Tecla | Ação |
+|:-----:|:-----|
 | `1` | Informar matriz e analisar (classificações 1 a 11) |
 | `2` | Transformar matriz (transposta, simetria, normalidade) |
 | `3` | Sair |
-| `M` | Ativar / desativar microfone |
-| `F` ou falar **fone** | Alternar **modo fone** (ATIVADO / DESATIVADO) |
-| `R` ou falar **repetir** | Repetir o último áudio (após análise/transformação) |
+
+### Teclas globais (qualquer tela)
+
+| Tecla | Voz | Ação |
+|:-----:|:----|:-----|
+| `Esc` | silêncio, parar, chega, calar, cortar | Corta a fala na hora |
+| `A` | rápido, acelerar | Voz mais rápida |
+| `D` | devagar, lento | Voz mais lenta |
+| `M` | microfone, eme | Liga ou desliga o microfone |
+| `F` | fone, fones, efe | Liga ou desliga o modo fone |
+| `H` | ajuda, agá | Repete a ajuda das teclas |
+| `R` | repetir, repete, repita | Repete o último áudio (quando a opção existe) |
+
+A velocidade vai de **0,50×** a **2,50×**, em passos de **0,10**. O padrão é **1,25×**. O menu mostra o valor atual.
+
+`Esc` durante a narração corta a fala e não perde a tecla seguinte.
 
 ### Modo fone e anti-eco
 
 | Modo fone | Comportamento |
 |:----------|:--------------|
-| **DESATIVADO** (padrão, alto-falante) | Microfone mudo enquanto o Piper fala; pausa maior após a fala; filtro de eco residual ativo |
-| **ATIVADO** (fone de ouvido) | Microfone também mudo durante a fala do Piper (zero eco); pausa curta após a fala; **sem** filtro de eco residual (não rejeita a sua fala real) |
+| **DESATIVADO** (padrão, alto-falante) | Microfone mudo enquanto o Piper fala; pausa de cerca de 0,85 s depois; filtro de eco residual por cerca de 1 s |
+| **ATIVADO** (fone de ouvido) | Microfone também mudo durante a fala; pausa curta (cerca de 0,15 s); **sem** filtro de eco residual |
 
-Em **ambos** os modos o microfone **não reconhece** enquanto o Piper está falando.  
 Fale os comandos **nas pausas**, depois que a voz terminar.
 
-### Entrada por voz (exemplos)
+### Entrada por voz
 
 | Fala | Resultado |
 |:-----|:----------|
 | `um espaço dois espaço três` | `1 2 3` |
-| `um dois três excluir` | `1 2` (apaga o último) |
+| `dois por três` | `2 3` (`por` = espaço) |
+| `vinte e três` | `23` |
+| `cento e vinte espaço cinco` | `120 5` |
+| `um dois três excluir` | `1 2` |
 | `um dois três pronto` | `1 2 3` + Enter |
-| `fone` | Alterna modo fone |
-| `repetir` | Repete o último áudio (quando a opção estiver disponível) |
+| `fone` | Alterna o modo fone |
+| `repetir` | Repete o último áudio |
+| `parar` | Corta a fala |
 
-### Vocabulário de voz
+Números falados vão de **0 a 999** (`dez`, `vinte e três`, `cento e vinte`, `duzentos`…).
+
+### Vocabulário
 
 **Números e edição**
 
 | Fala | Tecla |
 |:-----|:------|
-| zero … nove | `0` … `9` |
-| menos | `-` |
+| zero … nove, ou o número por extenso até 999 | dígitos |
+| menos / negativo | `-` |
 | vírgula / ponto | `,` |
-| espaço | espaço |
+| espaço / por | espaço |
 | apagar / excluir / voltar | backspace |
 | pronto / confirmar / enter | Enter |
 
-**Controle do programa**
-
-| Fala | Ação |
-|:-----|:-----|
-| fone / fones / efe | Alterna modo fone (`F`) |
-| repetir / repete / repita | Repete áudio (`R`) |
-
-**Operadores (vocabulário extra)**
+**Operadores**
 
 | Fala | Símbolo |
 |:-----|:--------|
-| mais / soma / somar | `+` |
-| menos / subtrai / subtrair | `-` |
-| vezes / multiplica / multiplicar | `*` |
-| dividido / divide / dividir | `/` |
+| mais / soma | `+` |
+| vezes / multiplica | `*` |
+| dividido / divide | `/` |
 | igual / resultado | `=` |
 
-Palavras de preenchimento como *por favor*, *então*, *agora*, *ok* são **ignoradas** e não viram tecla.
+Palavras de preenchimento (`por favor`, `então`, `agora`, `ok`, `sim`) são ignoradas. Palavra fora da gramática vira `[unk]` e também é ignorada.
 
 ### Dicas
 
-* Fale **depois** que o Piper terminar (o microfone fica mudo durante a voz)
-* Use **fone de ouvido** + tecla **F** (ou diga **fone**) para o modo mais confortável
-* Após uma análise, pressione **R** ou diga **repetir** para ouvir de novo
-* É possível reutilizar a **transposta** da última matriz informada
-* Nos menus, a narração não interrompe a si mesma (`falar_somente`), deixando a navegação mais fluida
+* Fale **depois** que o Piper terminar.
+* Com fone, pressione **F** ou diga **fone**.
+* Pressione **H** (ou diga **ajuda**) para ouvir as teclas.
+* A explicação de como digitar a matriz só é falada na **primeira** matriz da sessão.
+* Depois da análise, pressione **R** ou diga **repetir**.
+* Dá para reutilizar a transposta da última matriz informada.
 
 ## Estrutura do projeto
 
@@ -239,8 +250,10 @@ VOSK_MODEL_PATH     → pasta do modelo Vosk
 | Modelo Piper não encontrado | Rode o instalador ou baixe os `.onnx` manualmente |
 | Modelo Vosk não encontrado | Extraia o ZIP em `vosk_models/vosk-model-small-pt-0.3/` |
 | Microfone indisponível | Permita o microfone no sistema; no Linux: `sudo apt install libportaudio2` |
-| Eco / comandos duplicados no alto-falante | Deixe **modo fone DESATIVADO** ou use fone + **F** / diga **fone** |
-| Comando de voz ignorado | Espere o Piper terminar e fale na pausa |
+| Eco no alto-falante | Deixe o **modo fone DESATIVADO**, ou use fone e pressione **F** / diga **fone** |
+| A voz não para | Pressione **Esc** ou diga **parar** |
+| Comando ignorado | Espere o Piper terminar e fale na pausa |
+| “Velocidade não muda” | A versão instalada do Piper não tem `SynthesisConfig`; atualize `piper-tts` |
 | Avisos no VS Code (Pylance) | `Ctrl+Shift+P` → **Python: Select Interpreter** |
 
 ## Metodologia
@@ -251,11 +264,16 @@ O programa segue o fluxo:
 
 Controle de áudio e microfone:
 
-1. Enquanto o **Piper fala**, o microfone fica **mudo** (não envia áudio ao Vosk)
-2. Após a fala, há uma pausa curta (**modo fone**) ou maior (**alto-falante**)
-3. No alto-falante, um filtro adicional evita tratar o eco residual como comando
-4. No **modo fone**, esse filtro de texto é desligado para não rejeitar a fala real do usuário
-5. Frases reconhecidas são confirmadas uma vez; teclas virtuais da voz não disparam feedback digitado de novo
+1. Enquanto o Piper fala, o microfone fica mudo (não envia áudio ao Vosk).
+2. Depois da fala há uma pausa curta (modo fone) ou maior (alto-falante).
+3. No alto-falante, um filtro de cerca de 1 s ignora texto parecido com o que o Piper acabou de dizer.
+4. No modo fone esse filtro fica desligado, para não rejeitar a fala real.
+5. A gramática do Vosk só aceita o vocabulário do programa; o resto vira `[unk]` e é descartado.
+6. Frases de controle (fone, microfone, ajuda, velocidade, parar) não são lidas de volta.
+7. Teclas vindas da voz não disparam um segundo feedback falado de cada dígito.
+8. Áudios já sintetizados (mesma frase e mesma velocidade) ficam em cache.
+9. Cortar a fala descarta o que ainda estava na fila ou em síntese.
+10. Comparações de matriz usam tolerância pequena; matriz normal com inteiros é conferida em aritmética exata.
 
 ## Créditos
 
@@ -275,19 +293,25 @@ Controle de áudio e microfone:
 
 ##    Status 
 ---
+## Status
+
+---
 
 **Concluído / em uso**
 
 Versão multiplataforma (Windows + Ubuntu) com:
 
-* classificações 1–15  
-* voz Piper + microfone Vosk  
-* modo fone (tecla **F** ou comando de voz **fone**)  
-* anti-eco (microfone mudo durante a fala)  
-* comandos de voz ampliados (repetir, operadores, etc.)  
-* instaladores automáticos  
+* classificações 1–15
+* voz Piper + microfone Vosk
+* números falados de 0 a 999
+* velocidade da voz ajustável (A / D)
+* corte da fala (Esc)
+* modo fone (F ou “fone”)
+* anti-eco (microfone mudo durante a fala)
+* ajuda de teclas (H)
+* cache de áudio e instaladores automáticos
 
 ---
 
-**Classificador Automático de Matrizes**  
+**Classificador Automático de Matrizes**
 Projeto educacional de álgebra linear com acessibilidade por voz.
