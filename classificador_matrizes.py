@@ -4,11 +4,17 @@ import wave
 import queue
 import tempfile
 import shutil
+import subprocess
 import threading
 import json
 import time
 import unicodedata
 import platform
+import atexit
+import codecs
+import collections
+import io
+import signal
 import numpy as np
 
 # ============================================================
@@ -26,9 +32,19 @@ else:
     import select
 
 try:
-    from piper import PiperVoice, SynthesisConfig
-except ImportError:
     from piper import PiperVoice
+except ImportError:
+    print("ERRO: a biblioteca piper-tts não está instalada.")
+    print("Instale com:")
+    if WINDOWS:
+        print("    py -m pip install piper-tts")
+    else:
+        print("    python3 -m pip install piper-tts")
+    sys.exit(1)
+
+try:
+    from piper import SynthesisConfig
+except ImportError:
     SynthesisConfig = None
 
 try:
@@ -69,29 +85,68 @@ def _candidatos_modelo_voz():
     return candidatos
 
 
+PASTAS_IGNORADAS_NA_BUSCA = {
+    ".cache", ".config", ".local", ".git", "node_modules", "__pycache__",
+}
+
+
+def _buscar_na_home(aceita, profundidade_max=6, tempo_max=5.0):
+    """
+    Último recurso para achar um modelo: percorre a HOME, mas com limite de
+    profundidade e de tempo, para o programa não travar na abertura em
+    computadores com muitas pastas.
+    aceita(raiz, diretorios, arquivos) devolve o caminho achado ou None.
+    """
+    home = os.path.expanduser("~")
+    nivel_home = home.rstrip(os.sep).count(os.sep)
+    limite = time.monotonic() + tempo_max
+    try:
+        for raiz, diretorios, arquivos in os.walk(home):
+            if time.monotonic() > limite:
+                return None
+            if raiz.count(os.sep) - nivel_home >= profundidade_max:
+                diretorios[:] = []
+            else:
+                diretorios[:] = [d for d in diretorios if d not in PASTAS_IGNORADAS_NA_BUSCA]
+            achado = aceita(raiz, diretorios, arquivos)
+            if achado:
+                return achado
+    except Exception:
+        pass
+    return None
+
+
+def _achar_voz_piper(raiz, diretorios, arquivos):
+    for arquivo in arquivos:
+        if arquivo.startswith("pt_BR") and arquivo.endswith(".onnx"):
+            return os.path.join(raiz, arquivo)
+    return None
+
+
+def _achar_modelo_vosk(raiz, diretorios, arquivos):
+    for d in diretorios:
+        if d.startswith("vosk-model") and os.path.isfile(os.path.join(raiz, d, "am", "final.mdl")):
+            return os.path.join(raiz, d)
+    return None
+
+
 def localizar_modelo_voz():
     for caminho in _candidatos_modelo_voz():
         if caminho and os.path.isfile(caminho):
             return caminho
 
     # Último recurso: procura qualquer voz Piper em português dentro da HOME.
-    try:
-        for raiz, diretorios, arquivos in os.walk(os.path.expanduser("~")):
-            diretorios[:] = [d for d in diretorios if d not in {".cache", ".config", ".local"}]
-            for arquivo in arquivos:
-                if arquivo.startswith("pt_BR") and arquivo.endswith(".onnx"):
-                    return os.path.join(raiz, arquivo)
-    except Exception:
-        pass
-
-    return None
+    return _buscar_na_home(_achar_voz_piper)
 
 
 MODELO_VOZ = localizar_modelo_voz()
 
-# Velocidade da voz (quanto maior, mais rápida a fala)
+# Velocidade da voz (quanto maior, mais rápida a fala). Ajustável com A / D.
+# O Piper recebe length_scale = 1 / velocidade (1,25x -> 0,8).
 VELOCIDADE_VOZ = 1.25
-LENGTH_SCALE_VOZ = 1.0 / VELOCIDADE_VOZ
+VELOCIDADE_MIN = 0.50
+VELOCIDADE_MAX = 2.50
+PASSO_VELOCIDADE = 0.10
 
 VOLUME_VOZ = 1.0
 LARGURA = 65
@@ -120,15 +175,47 @@ except Exception as erro:
     sys.exit(1)
 print("Voz neural carregada.\n")
 
-if SynthesisConfig is not None:
-    CONFIG_VOZ = SynthesisConfig(
+velocidade_voz = VELOCIDADE_VOZ
+lock_velocidade = threading.Lock()
+
+
+def config_voz_atual(velocidade=None):
+    """Monta a configuração do Piper (velocidade vigente, se não for informada)."""
+    if SynthesisConfig is None:
+        return None
+    if velocidade is None:
+        with lock_velocidade:
+            velocidade = velocidade_voz
+    return SynthesisConfig(
         volume=VOLUME_VOZ,
-        length_scale=LENGTH_SCALE_VOZ
+        length_scale=1.0 / velocidade
     )
-else:
-    CONFIG_VOZ = None
+
 
 fila_voz = queue.Queue()
+
+# Cada fala entra na fila com o número da "geração" em que foi pedida.
+# Cortar a fala incrementa a geração: o que já estava em síntese não toca.
+geracao_fala = 0
+lock_geracao = threading.Lock()
+
+
+def _geracao_fala():
+    with lock_geracao:
+        return geracao_fala
+
+
+def _nova_geracao_fala():
+    global geracao_fala
+    with lock_geracao:
+        geracao_fala += 1
+        return geracao_fala
+
+
+def _enfileirar_fala(texto):
+    fila_voz.put((texto, _geracao_fala()))
+
+
 processo_atual = None
 lock_processo = threading.Lock()
 stream_reproducao = None  # usado com sounddevice
@@ -136,27 +223,60 @@ stream_reproducao = None  # usado com sounddevice
 # Guarda a última matriz digitada pelo usuário (para reaproveitar a transposta)
 ULTIMA_MATRIZ = None
 
+# A instrução de digitação só é falada por extenso na primeira matriz.
+INSTRUCOES_MATRIZ_FALADAS = False
+
 # Controle de gravação/repetição de áudio de uma operação
 GRAVANDO_FALA = False
 BUFFER_FALA = []
 ULTIMO_AUDIO = []
 
 
+# Falas já sintetizadas (texto + velocidade -> bytes do WAV), das mais
+# recentes para as mais antigas. Dígitos, "espaço", avisos e a repetição do
+# áudio (tecla R) deixam de esperar o Piper sintetizar de novo.
+LIMITE_CACHE_AUDIO = 48 * 1024 * 1024
+cache_audio = collections.OrderedDict()
+bytes_cache_audio = 0
+lock_cache_audio = threading.Lock()
+
+
+def _guardar_no_cache(chave, wav):
+    global bytes_cache_audio
+    if len(wav) > LIMITE_CACHE_AUDIO // 4:
+        return
+    with lock_cache_audio:
+        if chave in cache_audio:
+            return
+        cache_audio[chave] = wav
+        bytes_cache_audio += len(wav)
+        while bytes_cache_audio > LIMITE_CACHE_AUDIO and cache_audio:
+            _, removido = cache_audio.popitem(last=False)
+            bytes_cache_audio -= len(removido)
+
+
 def gerar_audio(texto):
-    arquivo = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    caminho = arquivo.name
-    arquivo.close()
-    try:
-        with wave.open(caminho, "wb") as wav_file:
-            if CONFIG_VOZ is None:
-                VOZ.synthesize_wav(texto, wav_file)
-            else:
-                VOZ.synthesize_wav(texto, wav_file, syn_config=CONFIG_VOZ)
-        return caminho
-    except Exception:
-        if os.path.exists(caminho):
-            os.remove(caminho)
-        raise
+    """Sintetiza o texto e devolve os bytes de um WAV (sem arquivo temporário)."""
+    with lock_velocidade:
+        velocidade = velocidade_voz
+    chave = (texto, velocidade if SynthesisConfig is not None else None)
+
+    with lock_cache_audio:
+        wav = cache_audio.get(chave)
+        if wav is not None:
+            cache_audio.move_to_end(chave)
+            return wav
+
+    config = config_voz_atual(velocidade)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        if config is None:
+            VOZ.synthesize_wav(texto, wav_file)
+        else:
+            VOZ.synthesize_wav(texto, wav_file, syn_config=config)
+    wav = buffer.getvalue()
+    _guardar_no_cache(chave, wav)
+    return wav
 
 
 # Após o Piper terminar: pausa + filtro de eco.
@@ -165,11 +285,10 @@ COOLDOWN_ECO_SEGUNDOS = 0.45
 SURDO_APOS_FALA_SEGUNDOS = 0.85
 # Com fone: surdo bem mais curto (quase não há eco).
 SURDO_APOS_FALA_FONE = 0.15
-# Energia mínima para barge-in (só usado COM fone).
-LIMIAR_ENERGIA_BARGE_IN_FONE = 0.008
-FATOR_ENERGIA_SOBRE_ECO_FONE = 1.35
 # Por quanto tempo rejeitar texto parecido com o que o Piper falou.
-JANELA_ECO_POS_FALA = 2.0
+# (Curta: o período surdo já cobre o eco; uma janela longa rejeitava o
+# usuário dizendo "dois" logo depois de o menu falar "dois".)
+JANELA_ECO_POS_FALA = 1.0
 
 # False = alto-falante (anti-eco, surdo mais longo após a fala).
 # True  = fone: também NÃO reconhece durante a fala do Piper (zero eco);
@@ -178,6 +297,8 @@ JANELA_ECO_POS_FALA = 2.0
 modo_fone = False
 lock_modo_fone = threading.Lock()
 pedido_interromper_audio = threading.Event()
+# Ligado enquanto o Piper está tocando uma fala (o microfone fica mudo).
+audio_piper_falando = threading.Event()
 
 # Texto que o Piper está falando / falou recentemente.
 texto_piper_atual = ""
@@ -220,11 +341,6 @@ def _microfone_esta_surdo():
         return time.monotonic() < microfone_surdo_ate
 
 
-def _obter_texto_piper():
-    with lock_texto_piper:
-        return texto_piper_atual
-
-
 def _textos_filtro_eco():
     """Textos atuais e recentes do Piper usados para detectar eco."""
     agora = time.monotonic()
@@ -259,7 +375,7 @@ def _parece_eco_do_piper(texto_reconhecido):
             continue
         if rec == falado:
             return True
-        if rec in falado or falado in rec:
+        if f" {rec} " in f" {falado} " or f" {falado} " in f" {rec} ":
             return True
         palavras_rec = set(rec.split())
         palavras_fal = set(falado.split())
@@ -273,43 +389,36 @@ def _parece_eco_do_piper(texto_reconhecido):
     return False
 
 
-def _extrair_comandos_uteis(texto):
-    """Retorna palavras do texto que são comandos de tecla (não ignoradas)."""
-    uteis = []
-    for palavra in texto.split():
-        chave = normalizar_palavra(palavra)
-        if chave in PALAVRAS_IGNORADAS:
-            continue
-        if chave in PALAVRA_PARA_TECLA:
-            uteis.append(chave)
-    return uteis
-
-
-def reproduzir_audio(caminho):
+def reproduzir_audio(wav, geracao=None):
     """
-    Reproduz um arquivo WAV usando sounddevice + soundfile (multiplataforma).
-    Pode ser interrompido a qualquer momento por interromper_audio_atual() (barge-in).
+    Reproduz um áudio WAV (bytes) usando sounddevice + soundfile (multiplataforma).
+    Pode ser interrompido a qualquer momento por interromper_audio_atual().
     """
-    global processo_atual, stream_reproducao
+    global processo_atual, stream_reproducao, texto_piper_atual, ultimo_texto_piper_ate
     interrompido = False
+
+    def cancelada():
+        if pedido_interromper_audio.is_set():
+            return True
+        return geracao is not None and geracao != _geracao_fala()
+
     try:
         pedido_interromper_audio.clear()
+        if cancelada():
+            interrompido = True
+            return
         audio_piper_falando.set()
 
         if sd is not None and sf is not None:
             try:
-                dados, taxa = sf.read(caminho, dtype="float32")
-                if getattr(dados, "ndim", 1) > 1:
-                    n_frames = len(dados)
-                else:
-                    n_frames = len(dados)
-                duracao = max(0.05, float(n_frames) / float(taxa))
+                dados, taxa = sf.read(io.BytesIO(wav), dtype="float32")
+                duracao = max(0.05, float(len(dados)) / float(taxa))
                 sd.play(dados, taxa, blocking=False)
                 with lock_processo:
                     stream_reproducao = True
                 fim = time.monotonic() + duracao + 0.15
                 while time.monotonic() < fim:
-                    if pedido_interromper_audio.is_set():
+                    if cancelada():
                         interrompido = True
                         try:
                             sd.stop()
@@ -331,8 +440,12 @@ def reproduzir_audio(caminho):
                 print("\nERRO: nenhum método de reprodução de áudio disponível.")
                 return
             processo = None
+            caminho = None
             try:
-                import subprocess
+                # Os players externos precisam de um arquivo.
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as arquivo:
+                    arquivo.write(wav)
+                    caminho = arquivo.name
                 processo = subprocess.Popen(
                     comando + [caminho],
                     stdout=subprocess.DEVNULL,
@@ -341,7 +454,7 @@ def reproduzir_audio(caminho):
                 with lock_processo:
                     processo_atual = processo
                 while processo.poll() is None:
-                    if pedido_interromper_audio.is_set():
+                    if cancelada():
                         interrompido = True
                         try:
                             processo.terminate()
@@ -357,22 +470,17 @@ def reproduzir_audio(caminho):
                 with lock_processo:
                     if processo_atual is processo:
                         processo_atual = None
+                _remover_arquivo(caminho)
     finally:
-        if not interrompido and not pedido_interromper_audio.is_set():
+        if not interrompido and not cancelada():
             time.sleep(COOLDOWN_ECO_SEGUNDOS)
         audio_piper_falando.clear()
         with lock_texto_piper:
-            global texto_piper_atual, ultimo_texto_piper_ate
             texto_piper_atual = ""
             if ultimo_texto_piper:
                 ultimo_texto_piper_ate = time.monotonic() + JANELA_ECO_POS_FALA
         # Período surdo: evita eco do alto-falante virar comando
         _marcar_microfone_surdo()
-        if os.path.exists(caminho):
-            try:
-                os.remove(caminho)
-            except Exception:
-                pass
 
 
 def _detectar_comando_reproducao():
@@ -398,6 +506,7 @@ def _detectar_comando_reproducao():
 def interromper_audio_atual():
     """Corta imediatamente qualquer áudio do Piper em reprodução."""
     global processo_atual, stream_reproducao
+    _nova_geracao_fala()
     pedido_interromper_audio.set()
     with lock_processo:
         tocando = stream_reproducao is not None
@@ -435,20 +544,30 @@ def limpar_fila():
             return
 
 
+def _remover_arquivo(caminho):
+    if caminho and os.path.exists(caminho):
+        try:
+            os.remove(caminho)
+        except OSError:
+            pass
+
+
 def trabalhador_voz():
     while True:
-        texto = fila_voz.get()
-        if texto is None:
+        item = fila_voz.get()
+        if item is None:
             fila_voz.task_done()
             return
-        caminho = None
+        texto, geracao = item
         try:
-            caminho = gerar_audio(texto)
-            reproduzir_audio(caminho)
+            if geracao != _geracao_fala():
+                continue
+            wav = gerar_audio(texto)
+            if geracao != _geracao_fala():
+                continue
+            reproduzir_audio(wav, geracao)
         except Exception as erro:
             print(f"\nErro na síntese de voz: {erro}")
-            if caminho and os.path.exists(caminho):
-                os.remove(caminho)
         finally:
             fila_voz.task_done()
 
@@ -463,14 +582,14 @@ def falar(texto, imprimir=False):
     if GRAVANDO_FALA:
         BUFFER_FALA.append(texto)
     _definir_texto_piper(texto)
-    fila_voz.put(texto)
+    _enfileirar_fala(texto)
 
 
 def falar_somente(texto):
     if GRAVANDO_FALA:
         BUFFER_FALA.append(texto)
     _definir_texto_piper(texto)
-    fila_voz.put(texto)
+    _enfileirar_fala(texto)
 
 
 def falar_interrompendo(texto, imprimir=False):
@@ -484,11 +603,34 @@ def falar_interrompendo(texto, imprimir=False):
     if imprimir:
         print(texto)
     _definir_texto_piper(texto)
-    fila_voz.put(texto)
+    _enfileirar_fala(texto)
+
+
+def cortar_fala():
+    """Silencia tudo: áudio tocando, fila e falas ainda em síntese."""
+    limpar_fila()
+    interromper_audio_atual()
+    _definir_texto_piper("")
 
 
 def esperar_voz():
     fila_voz.join()
+
+
+def esperar_voz_cortavel():
+    """
+    Espera a fala terminar, mas sem prender o teclado (só para a thread principal).
+    Esc corta a fala. Qualquer outra tecla também corta e é devolvida
+    ao próximo leitor, para o que o usuário digitou não se perder.
+    """
+    while fila_voz.unfinished_tasks > 0:
+        tecla = proxima_tecla(0.05)
+        if tecla is None:
+            continue
+        if tecla != "\x1b":
+            teclas_devolvidas.append((tecla, ultima_tecla_silenciosa))
+        cortar_fala()
+        return
 
 
 def iniciar_captura_audio():
@@ -517,16 +659,16 @@ def repetir_ultimo_audio():
     """
     if not ULTIMO_AUDIO:
         falar_interrompendo("Não há áudio para repetir.", imprimir=True)
-        esperar_voz()
+        esperar_voz_cortavel()
         return
 
     limpar_fila()
     interromper_audio_atual()
 
     for texto in ULTIMO_AUDIO:
-        fila_voz.put(texto)
+        _enfileirar_fala(texto)
 
-    esperar_voz()
+    esperar_voz_cortavel()
 
 
 def oferecer_repeticao_audio():
@@ -542,10 +684,7 @@ def oferecer_repeticao_audio():
         print("  [Qualquer outra tecla]  Voltar ao menu")
         linha_fina()
 
-        falar_interrompendo(
-            "Pressione R para repetir o áudio, "
-            "ou qualquer outra tecla para voltar ao menu."
-        )
+        falar_somente("R repete. Outra tecla volta ao menu.")
 
         tecla = ler_tecla_menu()
 
@@ -564,13 +703,26 @@ DIGITOS = {
 
 
 def numero_para_texto(valor):
-    if np.isclose(valor, round(valor)):
+    valor = float(valor)
+    if np.isnan(valor):
+        return "indefinido"
+    if np.isinf(valor):
+        return "infinito" if valor > 0 else "-infinito"
+    if abs(valor) < 1e-9 or abs(valor - round(valor)) < 1e-9:
         return str(int(round(valor)))
-    return f"{float(valor):.4f}".rstrip("0").rstrip(".").replace(".", ",")
+    texto = f"{valor:.4f}".rstrip("0").rstrip(".")
+    if texto in ("", "0", "-0"):
+        # Não mostrar zero para um valor que não é zero (ex.: 0,00004).
+        texto = f"{valor:.15f}".rstrip("0").rstrip(".")
+    return texto.replace(".", ",")
 
 
 def numero_para_fala(valor):
     texto = numero_para_texto(valor)
+    if texto in ("indefinido", "infinito"):
+        return texto
+    if texto == "-infinito":
+        return "menos infinito"
     resultado = []
     for caractere in texto:
         if caractere == "-":
@@ -590,8 +742,6 @@ MODELO_MICROFONE = None
 MODELO_VOSK = None
 MICROFONE_DISPONIVEL = False
 MICROFONE_ATIVO = False
-MICROFONE_DISPOSITIVO = None
-MICROFONE_TAXA_REAL = TAXA_VOSK
 ERRO_MICROFONE = ""
 
 # Procura automaticamente o modelo, inclusive dentro da HOME e da pasta do programa.
@@ -607,19 +757,9 @@ for caminho_modelo in CAMINHOS_MODELO_VOSK:
         MODELO_MICROFONE = caminho_modelo
         break
 
-# Último recurso: procura diretórios vosk-model* diretamente na HOME.
+# Último recurso: procura diretórios vosk-model* dentro da HOME.
 if MODELO_MICROFONE is None:
-    try:
-        for raiz, diretorios, _ in os.walk(os.path.expanduser("~")):
-            diretorios[:] = [d for d in diretorios if d not in {".cache", ".config", ".local"}]
-            for d in list(diretorios):
-                if d.startswith("vosk-model") and os.path.isfile(os.path.join(raiz, d, "am", "final.mdl")):
-                    MODELO_MICROFONE = os.path.join(raiz, d)
-                    break
-            if MODELO_MICROFONE:
-                break
-    except Exception:
-        pass
+    MODELO_MICROFONE = _buscar_na_home(_achar_modelo_vosk)
 
 if vosk is None:
     ERRO_MICROFONE = "A biblioteca Vosk não está instalada."
@@ -653,47 +793,211 @@ thread_microfone = None
 thread_frases = None
 parar_microfone_evento = threading.Event()
 parar_microfone_evento.set()
-audio_piper_falando = threading.Event()
-# Quando setado, o callback do microfone descarta o estado interno do Vosk
-# (evita que eco do Piper vire comando).
-resetar_reconhecedor_vosk = threading.Event()
 # Impede processar_texto_reconhecido reentrante (loop de eco)
 lock_processar_voz = threading.Lock()
 
+# ------------------------------------------------------------
+# Vocabulário de voz
+# Todas as chaves ficam sem acento e em minúsculas: a frase reconhecida
+# é normalizada antes da consulta ("Três" -> "tres").
+# ------------------------------------------------------------
+UNIDADES_FALADAS = {
+    "zero": 0, "um": 1, "uma": 1, "dois": 2, "duas": 2, "tres": 3,
+    "quatro": 4, "cinco": 5, "seis": 6, "sete": 7, "oito": 8, "nove": 9,
+}
+ESPECIAIS_FALADOS = {
+    "dez": 10, "onze": 11, "doze": 12, "treze": 13, "catorze": 14,
+    "quatorze": 14, "quinze": 15, "dezesseis": 16, "dezasseis": 16,
+    "dezessete": 17, "dezassete": 17, "dezoito": 18, "dezenove": 19,
+    "dezanove": 19,
+}
+DEZENAS_FALADAS = {
+    "vinte": 20, "trinta": 30, "quarenta": 40, "cinquenta": 50,
+    "sessenta": 60, "setenta": 70, "oitenta": 80, "noventa": 90,
+}
+CENTENAS_FALADAS = {
+    "cem": 100, "cento": 100,
+    "duzentos": 200, "duzentas": 200, "trezentos": 300, "trezentas": 300,
+    "quatrocentos": 400, "quatrocentas": 400, "quinhentos": 500,
+    "quinhentas": 500, "seiscentos": 600, "seiscentas": 600,
+    "setecentos": 700, "setecentas": 700, "oitocentos": 800,
+    "oitocentas": 800, "novecentos": 900, "novecentas": 900,
+}
+NUMEROS_FALADOS = {}
+for _tabela in (UNIDADES_FALADAS, ESPECIAIS_FALADOS, DEZENAS_FALADAS, CENTENAS_FALADAS):
+    NUMEROS_FALADOS.update(_tabela)
+
+# Palavras que viram uma tecla. Os números (de zero a novecentos e noventa e
+# nove) são montados por frase_para_teclas(), não por esta tabela.
 PALAVRA_PARA_TECLA = {
     "zero": "0", "um": "1", "uma": "1", "dois": "2", "duas": "2",
-    "tres": "3", "três": "3", "quatro": "4", "cinco": "5", "seis": "6",
-    "sete": "7", "oito": "8", "nove": "9", "menos": "-",
-    "virgula": ",", "vírgula": ",", "ponto": ",",
-    "espaco": " ", "espaço": " ",
+    "tres": "3", "quatro": "4", "cinco": "5", "seis": "6",
+    "sete": "7", "oito": "8", "nove": "9",
+    "menos": "-", "negativo": "-", "subtrai": "-", "subtrair": "-",
+    "virgula": ",", "ponto": ",",
+    "espaco": " ", "por": " ",
     "apaga": "\x7f", "apagar": "\x7f", "apague": "\x7f", "voltar": "\x7f",
     "excluir": "\x7f",
     "confirma": "\r", "confirmar": "\r", "confirme": "\r",
     "enter": "\r", "pronto": "\r", "terminar": "\r", "terminado": "\r",
-    "finalizar": "\r", "finaliza": "\r", "por": " ",
+    "finalizar": "\r", "finaliza": "\r",
     "vezes": "*", "vez": "*", "multiplica": "*", "multiplicar": "*",
     "dividido": "/", "divide": "/", "dividir": "/",
     "mais": "+", "soma": "+", "somar": "+",
-    "menos": "-", "subtrai": "-", "subtrair": "-",
     "igual": "=", "resultado": "=",
-    "R": "R", "r": "R", "repetir": "R", "repete": "R", "ere": "R", "repita": "R", "repita": "R",
-    "F": "F", "f": "F", "efe": "F", "efe": "F", "fone": "F", "fone": "F", "fones": "F", "fones": "F", "éfe": "F", "éfes": "F", "efes": "F", "efes": "F",
+    # Letras (nome falado da letra) e comandos que equivalem a uma tecla.
+    "r": "R", "erre": "R", "ere": "R", "repetir": "R", "repete": "R",
+    "repita": "R",
+    "f": "F", "efe": "F", "efes": "F", "fone": "F", "fones": "F",
+    "eme": "M", "microfone": "M",
+    "aga": "H", "ajuda": "H",
+    "rapido": "A", "acelerar": "A", "acelera": "A",
+    "devagar": "D", "lento": "D", "desacelerar": "D",
+    "silencio": "\x1b", "calar": "\x1b", "cala": "\x1b", "parar": "\x1b",
+    "pare": "\x1b", "cortar": "\x1b", "escape": "\x1b", "chega": "\x1b",
 }
 
 PALAVRAS_IGNORADAS = {
-    "digite", "digitar", "número", "numero", "números", "numeros",
+    "digite", "digitar", "numero", "numeros",
     "elemento", "elementos", "linha", "linhas", "coluna", "colunas",
     "o", "a", "e", "de", "da", "do",
-    "por favor", "porfavor", "por", "favor",
-    "então", "entao", "então", "entao", "então", "entao",
-    "agora", "faça", "faca",
-    "ok", "okay", "certo", "sim", "não", "nao",
+    "favor", "porfavor", "entao", "agora", "faca",
+    "ok", "okay", "certo", "sim", "nao",
+    "[unk]",
 }
+
+# Comandos que só mexem no programa: não vale a pena ler a frase de volta.
+TECLAS_DE_CONTROLE = {"R", "F", "M", "H", "A", "D", "\x1b"}
+
+# Forma com acento, como costuma estar no vocabulário do modelo Vosk.
+FORMAS_ACENTUADAS = {
+    "tres": "três", "virgula": "vírgula", "espaco": "espaço",
+    "efe": "éfe", "efes": "éfes", "aga": "agá", "erre": "errê",
+    "silencio": "silêncio", "rapido": "rápido", "entao": "então",
+    "numero": "número", "numeros": "números", "faca": "faça",
+    "nao": "não",
+}
+
+
+def _montar_gramatica_vosk():
+    """
+    Lista de palavras que o Vosk pode reconhecer. "[unk]" faz o que não é
+    comando virar "desconhecido", em vez de ser forçado para o número ou
+    comando mais parecido (principal causa de comandos falsos).
+    """
+    palavras = set(PALAVRA_PARA_TECLA) | set(NUMEROS_FALADOS) | {"e"}
+    for chave in list(palavras):
+        if chave in FORMAS_ACENTUADAS:
+            palavras.add(FORMAS_ACENTUADAS[chave])
+    return sorted(palavras) + ["[unk]"]
+
+
+GRAMATICA_VOSK = _montar_gramatica_vosk()
 
 
 def normalizar_palavra(palavra):
     forma_decomposta = unicodedata.normalize("NFKD", palavra)
     return "".join(c for c in forma_decomposta if not unicodedata.combining(c)).lower()
+
+
+def limpar_texto_vosk(texto):
+    """Remove os marcadores "[unk]" (palavra fora da gramática)."""
+    return " ".join(
+        p for p in (texto or "").split() if p.lower() != "[unk]"
+    )
+
+
+def _depois_do_e(palavras, i):
+    """Índice depois de um "e" opcional que liga duas partes de um número."""
+    if i < len(palavras) and palavras[i] == "e":
+        return i + 1
+    return i
+
+
+def _somar_unidade(palavras, i, valor):
+    """Soma uma unidade de 1 a 9 ("vinte e três"), com ou sem o "e"."""
+    j = _depois_do_e(palavras, i)
+    if j < len(palavras):
+        unidade = UNIDADES_FALADAS.get(palavras[j])
+        if unidade:
+            return valor + unidade, j + 1
+    return valor, i
+
+
+def _ler_numero_falado(palavras, i):
+    """
+    Lê um número falado a partir de palavras[i] e devolve (valor, próximo i).
+    "vinte e três" -> 23, "cento e cinco" -> 105, "dez" -> 10.
+    Duas unidades seguidas continuam separadas ("dois três" -> 2 e 3).
+    """
+    palavra = palavras[i]
+    i += 1
+
+    if palavra in CENTENAS_FALADAS:
+        valor = CENTENAS_FALADAS[palavra]
+        j = _depois_do_e(palavras, i)
+        if j < len(palavras):
+            proxima = palavras[j]
+            if proxima in ESPECIAIS_FALADOS:
+                return valor + ESPECIAIS_FALADOS[proxima], j + 1
+            if proxima in DEZENAS_FALADAS:
+                valor += DEZENAS_FALADAS[proxima]
+                return _somar_unidade(palavras, j + 1, valor)
+        return _somar_unidade(palavras, i, valor)
+
+    if palavra in DEZENAS_FALADAS:
+        return _somar_unidade(palavras, i, DEZENAS_FALADAS[palavra])
+
+    if palavra in ESPECIAIS_FALADOS:
+        return ESPECIAIS_FALADOS[palavra], i
+
+    return UNIDADES_FALADAS[palavra], i
+
+
+def frase_para_teclas(texto):
+    """
+    Converte uma frase reconhecida na lista de teclas que ela representa.
+    Palavras desconhecidas e de preenchimento são descartadas sem
+    quebrar as expressões ("dois por três" -> 2, espaço, 3).
+    """
+    palavras = [normalizar_palavra(p) for p in (texto or "").split()]
+    palavras = [p for p in palavras if p]
+
+    # "por favor" é educação, não o separador "por".
+    limpas = []
+    i = 0
+    while i < len(palavras):
+        if palavras[i] == "por" and i + 1 < len(palavras) and palavras[i + 1] in ("favor", "porfavor"):
+            i += 2
+            continue
+        limpas.append(palavras[i])
+        i += 1
+    palavras = limpas
+
+    teclas = []
+    i = 0
+    while i < len(palavras):
+        palavra = palavras[i]
+
+        # "mais rápido" / "mais devagar" são comandos de velocidade, não o sinal de mais.
+        if palavra == "mais" and i + 1 < len(palavras) and palavras[i + 1] in ("rapido", "devagar", "lento"):
+            i += 1
+            continue
+
+        if palavra in NUMEROS_FALADOS:
+            valor, i = _ler_numero_falado(palavras, i)
+            teclas.extend(str(valor))
+            continue
+
+        if palavra in PALAVRAS_IGNORADAS:
+            i += 1
+            continue
+
+        if palavra in PALAVRA_PARA_TECLA:
+            teclas.append(PALAVRA_PARA_TECLA[palavra])
+
+        i += 1
+    return teclas
 
 
 def limpar_fila_teclas_voz():
@@ -709,13 +1013,21 @@ def processar_texto_reconhecido(texto, barge_in=False):
     """
     Transforma uma frase reconhecida em eventos de entrada.
 
+    Frases sem nenhum comando útil são descartadas sem cortar a fala.
+
     Barge-in: corta a leitura na hora e executa o comando SEM esperar
     confirmação falada (resposta imediata).
 
     Reconhecimento normal: confirma a frase uma vez, depois injeta teclas.
+    Comandos de controle (velocidade, ajuda, letras) não são lidos de volta.
     """
-    texto = texto.strip()
+    texto = limpar_texto_vosk(texto)
     if not texto:
+        return
+
+    teclas = frase_para_teclas(texto)
+    if not teclas:
+        print(f"[MIC] Ouvi, mas não é um comando: {texto}")
         return
 
     if _parece_eco_do_piper(texto):
@@ -733,29 +1045,22 @@ def processar_texto_reconhecido(texto, barge_in=False):
         interromper_audio_atual()
         _definir_texto_piper("")
 
-        if barge_in:
-            # Interrompe e executa na hora (sem ler de novo a frase)
-            print("[MIC] Interrompendo leitura e executando comando...")
-            for palavra in texto.split():
-                chave = normalizar_palavra(palavra)
-                if chave in PALAVRAS_IGNORADAS:
-                    continue
-                if chave in PALAVRA_PARA_TECLA:
-                    fila_teclas_voz.put(("v", PALAVRA_PARA_TECLA[chave]))
+        so_controle = all(t in TECLAS_DE_CONTROLE for t in teclas)
+
+        if barge_in or so_controle:
+            # Executa na hora (sem ler de novo a frase)
+            for tecla in teclas:
+                fila_teclas_voz.put(("v", tecla))
             return
 
         # Fluxo normal: confirma a frase uma vez, depois teclas silenciosas
         print(f"[VOZ] {texto}")
         _definir_texto_piper(texto)
-        fila_voz.put(texto)
+        _enfileirar_fala(texto)
         esperar_voz()
 
-        for palavra in texto.split():
-            chave = normalizar_palavra(palavra)
-            if chave in PALAVRAS_IGNORADAS:
-                continue
-            if chave in PALAVRA_PARA_TECLA:
-                fila_teclas_voz.put(("v", PALAVRA_PARA_TECLA[chave]))
+        for tecla in teclas:
+            fila_teclas_voz.put(("v", tecla))
     finally:
         lock_processar_voz.release()
 
@@ -792,7 +1097,7 @@ thread_frases.start()
 
 def enfileirar_frase_reconhecida(texto, barge_in=False):
     """Chamado pelo callback: só enfileira, não bloqueia."""
-    texto = (texto or "").strip()
+    texto = limpar_texto_vosk(texto).strip()
     if not texto:
         return
     # Sem fone: ignora tudo no período surdo (anti-eco)
@@ -807,43 +1112,72 @@ def enfileirar_frase_reconhecida(texto, barge_in=False):
 
 
 def criar_reconhecedor(taxa):
-    # Gramática apenas com palavras do dicionário de comandos
-    # (evita WARNING de palavras ausentes no vocabulário do modelo)
-    palavras = sorted(set(PALAVRA_PARA_TECLA.keys()))
+    # Gramática com números, letras e comandos, mais "[unk]" para tudo o
+    # que não for comando (veja GRAMATICA_VOSK).
     try:
         return vosk.KaldiRecognizer(
             MODELO_VOSK, taxa,
-            json.dumps(palavras, ensure_ascii=False)
+            json.dumps(GRAMATICA_VOSK, ensure_ascii=False)
         )
     except Exception:
         return vosk.KaldiRecognizer(MODELO_VOSK, taxa)
 
 
-def reamostrar_para_16k(audio, taxa_origem):
+def _filtro_passa_baixa(taxa_origem, taps=63):
+    """FIR passa-baixa (janela de Hamming) que corta acima de ~7,2 kHz."""
+    corte = 0.45 * TAXA_VOSK / float(taxa_origem)
+    n = np.arange(taps) - (taps - 1) / 2.0
+    h = 2.0 * corte * np.sinc(2.0 * corte * n) * np.hamming(taps)
+    return (h / np.sum(h)).astype(np.float32)
+
+
+class Reamostrador16k:
     """
-    Recebe áudio float32 (mono ou multi-canal), converte para mono
-    e reamostra para 16000 Hz se necessário. Retorna float32 mono.
+    Converte blocos de áudio mono da taxa do microfone para 16 kHz.
+
+    Antes de reduzir a taxa, aplica um filtro passa-baixa; sem ele, ruído
+    agudo (acima de 8 kHz) se dobra para dentro da faixa da voz e atrapalha
+    o Vosk. Guarda o estado entre blocos, então não há emendas a cada 100 ms.
     """
-    audio = np.asarray(audio, dtype=np.float32)
 
-    # Estéreo / multi-canal → mono
-    if audio.ndim > 1:
-        audio = np.mean(audio, axis=1)
+    def __init__(self, taxa_origem):
+        self.taxa = int(taxa_origem)
+        self.filtro = _filtro_passa_baixa(self.taxa) if self.taxa > TAXA_VOSK else None
+        self.reiniciar()
 
-    taxa_origem = int(taxa_origem)
-    if taxa_origem == TAXA_VOSK:
-        return audio
+    def reiniciar(self):
+        tamanho = 0 if self.filtro is None else len(self.filtro) - 1
+        self.cauda = np.zeros(tamanho, dtype=np.float32)
+        self.ultimo = 0.0
+        self.pos = 0.0
 
-    if taxa_origem <= 0 or len(audio) == 0:
-        return np.array([], dtype=np.float32)
+    def processar(self, bloco):
+        x = np.asarray(bloco, dtype=np.float32).reshape(-1)
+        if self.taxa == TAXA_VOSK or len(x) == 0:
+            return x
 
-    # Reamostragem linear simples com numpy
-    n_destino = int(round(len(audio) * TAXA_VOSK / taxa_origem))
-    if n_destino <= 0:
-        return np.array([], dtype=np.float32)
+        if self.filtro is not None:
+            ext = np.concatenate([self.cauda, x])
+            y = np.convolve(ext, self.filtro, mode="valid")
+            self.cauda = ext[len(ext) - len(self.cauda):]
+        else:
+            y = x
 
-    indices = np.linspace(0, len(audio) - 1, n_destino)
-    return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+        passo = self.taxa / float(TAXA_VOSK)
+        limite = len(y) - 1 - self.pos
+        if limite < 0:
+            self.pos -= len(y)
+            self.ultimo = float(y[-1])
+            return np.array([], dtype=np.float32)
+
+        n = int(limite // passo) + 1
+        posicoes = self.pos + passo * np.arange(n)
+        com_anterior = np.concatenate([[self.ultimo], y])
+        saida = np.interp(posicoes + 1.0, np.arange(len(com_anterior)), com_anterior)
+
+        self.pos = self.pos + passo * n - len(y)
+        self.ultimo = float(y[-1])
+        return saida.astype(np.float32)
 
 
 def float32_para_pcm16(audio_float):
@@ -914,13 +1248,12 @@ def encontrar_microfone():
 def trabalhador_microfone_sounddevice():
     """
     Captura o microfone via sounddevice (Windows e Ubuntu).
-    Abre na taxa nativa, mono, reamostra para 16 kHz → Vosk.
+    Abre na taxa nativa, reamostra para 16 kHz mono e entrega ao Vosk.
 
-    Continua ouvindo ENQUANTO o Piper fala (barge-in):
-    se o usuário falar com energia suficiente e o texto
-    não for eco do Piper, a leitura é interrompida e o comando executado.
+    Enquanto o Piper fala (e um instante depois) o microfone fica mudo:
+    nada é reconhecido, o que evita que o eco vire comando.
     """
-    global MICROFONE_ATIVO, MICROFONE_TAXA_REAL, ERRO_MICROFONE, MICROFONE_DISPOSITIVO
+    global MICROFONE_ATIVO, ERRO_MICROFONE
 
     try:
         indice, erro = encontrar_microfone()
@@ -932,9 +1265,6 @@ def trabalhador_microfone_sounddevice():
         taxa_nativa = int(float(info.get("default_samplerate", 48000)))
         max_canais = int(info.get("max_input_channels", 1) or 1)
         canais = 1 if max_canais < 1 else min(2, max_canais)
-
-        MICROFONE_DISPOSITIVO = indice
-        MICROFONE_TAXA_REAL = taxa_nativa
 
         # ~100 ms de áudio por bloco → reconhecimento mais responsivo
         blocksize = max(256, int(taxa_nativa * 0.1))
@@ -956,10 +1286,7 @@ def trabalhador_microfone_sounddevice():
         print("[MIC] Abrindo captura...")
 
         reconhecedor = criar_reconhecedor(TAXA_VOSK)
-        # RMS médio do eco do alto-falante enquanto o Piper fala
-        eco_baseline = {"rms": 0.0, "amostras": 0}
-        ultimo_partial_barge = {"texto": "", "t": 0.0}
-
+        reamostrador = Reamostrador16k(taxa_nativa)
         def _flush_vosk():
             try:
                 if hasattr(reconhecedor, "Reset"):
@@ -968,13 +1295,6 @@ def trabalhador_microfone_sounddevice():
                     reconhecedor.FinalResult()
             except Exception:
                 pass
-
-        def _limiares_atuais():
-            with lock_modo_fone:
-                fone_ativo = modo_fone
-            if fone_ativo:
-                return LIMIAR_ENERGIA_BARGE_IN_FONE, FATOR_ENERGIA_SOBRE_ECO_FONE
-            return LIMIAR_ENERGIA_BARGE_IN, FATOR_ENERGIA_SOBRE_ECO
 
         def callback(indata, frames, tempo, status):
             if status:
@@ -987,37 +1307,29 @@ def trabalhador_microfone_sounddevice():
                 else:
                     mono_nativo = audio
 
-                rms = float(np.sqrt(np.mean(np.square(mono_nativo)))) if len(mono_nativo) else 0.0
-                piper_ativo = audio_piper_falando.is_set()
-                with lock_modo_fone:
-                    fone_ativo = modo_fone
-
                 # ----- Enquanto o Piper fala: NUNCA reconhece (zero eco) -----
                 # Vale para alto-falante e para modo fone.
-                if piper_ativo:
+                if audio_piper_falando.is_set():
                     _flush_vosk()
-                    eco_baseline["rms"] = 0.0
-                    eco_baseline["amostras"] = 0
-                    ultimo_partial_barge["texto"] = ""
+                    reamostrador.reiniciar()
                     return
 
                 # ----- Piper parado -----
                 # Período surdo após a fala (eco residual / ring do ambiente)
                 if _microfone_esta_surdo():
                     _flush_vosk()
+                    reamostrador.reiniciar()
                     return
 
-                eco_baseline["rms"] = 0.0
-                eco_baseline["amostras"] = 0
-                ultimo_partial_barge["texto"] = ""
-
-                audio_16k = reamostrar_para_16k(audio, taxa_nativa)
+                audio_16k = reamostrador.processar(mono_nativo)
                 if len(audio_16k) == 0:
                     return
                 pcm = float32_para_pcm16(audio_16k)
 
                 if reconhecedor.AcceptWaveform(pcm):
-                    texto = json.loads(reconhecedor.Result()).get("text", "").strip()
+                    texto = limpar_texto_vosk(
+                        json.loads(reconhecedor.Result()).get("text", "")
+                    ).strip()
                     if not texto:
                         return
                     if _parece_eco_do_piper(texto):
@@ -1052,7 +1364,6 @@ def trabalhador_microfone_sounddevice():
         print(f"\nERRO REAL DO MICROFONE: {erro}")
     finally:
         MICROFONE_ATIVO = False
-        MICROFONE_DISPOSITIVO = None
 
 
 def trabalhador_microfone():
@@ -1077,18 +1388,11 @@ def alternar_modo_fone():
         modo_fone = not modo_fone
         ativo = modo_fone
     if ativo:
-        msg = (
-            "Modo fone ativado. "
-            "Sem filtro de eco residual. "
-            "Fale nas pausas após a voz."
-        )
+        print("[MIC] Modo fone: sem filtro de eco residual; fale nas pausas após a voz.")
+        falar_interrompendo("Modo fone ativado.")
     else:
-        msg = (
-            "Modo fone desativado. "
-            "Anti-eco para alto-falante ativo."
-        )
-    print(f"[MIC] {msg}")
-    falar_interrompendo(msg, imprimir=True)
+        print("[MIC] Modo fone desativado: anti-eco de alto-falante ativo.")
+        falar_interrompendo("Modo fone desativado.")
 
 
 def alternar_microfone():
@@ -1100,6 +1404,9 @@ def alternar_microfone():
     if MICROFONE_ATIVO:
         parar_microfone_evento.set()
         MICROFONE_ATIVO = False
+        # Espera o stream fechar, para não haver dois abertos ao reativar.
+        if thread_microfone is not None and thread_microfone.is_alive():
+            thread_microfone.join(timeout=1.0)
         limpar_fila_teclas_voz()
         falar_interrompendo("Microfone desativado.")
         return
@@ -1123,7 +1430,8 @@ def alternar_microfone():
         time.sleep(0.03)
 
     if MICROFONE_ATIVO:
-        falar_interrompendo("Microfone ativado. Fale depois que eu terminar de falar.")
+        print("[MIC] Fale depois que a voz terminar.")
+        falar_interrompendo("Microfone ativado.")
     else:
         parar_microfone_evento.set()
         mensagem = ERRO_MICROFONE or "não foi possível abrir o dispositivo de entrada."
@@ -1211,64 +1519,148 @@ def _normalizar_item_fila_voz(item):
     return item
 
 
+# Teclas já lidas e ainda não consumidas: (tecla, veio_da_voz).
+teclas_devolvidas = collections.deque()
+
+_buffer_teclado = collections.deque()
+_decodificador_utf8 = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+_termios_original = None
+
+
+def ligar_terminal_imediato():
+    """
+    Linux: mantém o terminal em modo cbreak durante todo o programa
+    (sem eco e sem esperar Enter). O que o usuário digita enquanto a voz
+    fala fica guardado e é lido em seguida, em vez de aparecer na tela
+    e ser descartado.
+    """
+    global _termios_original
+    if WINDOWS or _termios_original is not None or not sys.stdin.isatty():
+        return
+    fd = sys.stdin.fileno()
+    _termios_original = termios.tcgetattr(fd)
+    tty.setcbreak(fd, termios.TCSANOW)
+
+
+def desligar_terminal_imediato():
+    global _termios_original
+    if WINDOWS or _termios_original is None:
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _termios_original)
+    except Exception:
+        pass
+    _termios_original = None
+
+
+atexit.register(desligar_terminal_imediato)
+
+
+def _ler_texto_stdin(espera):
+    """Lê o que estiver disponível no teclado (Linux) sem usar o buffer do sys.stdin."""
+    fd = sys.stdin.fileno()
+    prontos, _, _ = select.select([fd], [], [], espera)
+    if not prontos:
+        return ""
+    dados = os.read(fd, 256)
+    if not dados:
+        time.sleep(espera)
+        return ""
+    return _decodificador_utf8.decode(dados)
+
+
+def _tecla_fisica_linux(espera):
+    """
+    Devolve um caractere, "" para sequências ignoradas (setas, Home...)
+    ou None se nada foi digitado dentro do tempo de espera.
+    """
+    if not _buffer_teclado:
+        _buffer_teclado.extend(_ler_texto_stdin(espera))
+    if not _buffer_teclado:
+        return None
+
+    tecla = _buffer_teclado.popleft()
+    if tecla != "\x1b":
+        return tecla
+
+    # Esc sozinho corta a fala; Esc seguido de [ ou O é uma tecla especial.
+    if not _buffer_teclado:
+        _buffer_teclado.extend(_ler_texto_stdin(0.03))
+    if _buffer_teclado and _buffer_teclado[0] in "[O":
+        _buffer_teclado.popleft()
+        while True:
+            if not _buffer_teclado:
+                _buffer_teclado.extend(_ler_texto_stdin(0.03))
+                if not _buffer_teclado:
+                    break
+            final = _buffer_teclado.popleft()
+            if "@" <= final <= "~":
+                break
+        return ""
+    return "\x1b"
+
+
+def _tecla_fisica_windows(espera):
+    fim = time.monotonic() + espera
+    while True:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            # Teclas especiais (setas etc.) geram dois caracteres
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                return ""
+            return ch
+        if time.monotonic() >= fim:
+            return None
+        time.sleep(0.01)
+
+
+def _tecla_fisica(espera):
+    if WINDOWS:
+        return _tecla_fisica_windows(espera)
+    return _tecla_fisica_linux(espera)
+
+
+def proxima_tecla(espera=None):
+    """
+    Próxima tecla, na ordem: devolvidas, voz (tecla virtual) e teclado.
+    Sem espera, bloqueia até chegar uma tecla; com espera, devolve None
+    se nada chegar a tempo.
+    """
+    global ultima_tecla_silenciosa
+    limite = None if espera is None else time.monotonic() + espera
+    while True:
+        if teclas_devolvidas:
+            tecla, silenciosa = teclas_devolvidas.popleft()
+            ultima_tecla_silenciosa = silenciosa
+            return tecla
+
+        try:
+            item = fila_teclas_voz.get_nowait()
+            return _normalizar_item_fila_voz(item)
+        except queue.Empty:
+            pass
+
+        tecla = _tecla_fisica(0.05)
+        if tecla:
+            ultima_tecla_silenciosa = False
+            return tecla
+
+        if limite is not None and time.monotonic() >= limite:
+            return None
+
+
 class LeitorTeclado:
     def __init__(self):
         self.ativo = False
-        if not WINDOWS:
-            self.fd = sys.stdin.fileno()
-            self.original = termios.tcgetattr(self.fd)
 
     def iniciar(self):
-        if WINDOWS:
-            self.ativo = True
-            return
-        if not self.ativo:
-            tty.setraw(self.fd)
-            self.ativo = True
+        ligar_terminal_imediato()
+        self.ativo = True
 
     def restaurar(self):
-        if WINDOWS:
-            self.ativo = False
-            return
-        if self.ativo:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.original)
-            self.ativo = False
-
-    def _ler_tecla_windows(self):
-        """Lê uma tecla no Windows via msvcrt (não bloqueia indefinidamente)."""
-        global ultima_tecla_silenciosa
-        while True:
-            # Prioridade: teclas virtuais vindas da voz
-            try:
-                item = fila_teclas_voz.get_nowait()
-                return _normalizar_item_fila_voz(item)
-            except queue.Empty:
-                pass
-
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
-                # Teclas especiais (setas etc.) geram dois caracteres
-                if ch in ("\x00", "\xe0"):
-                    msvcrt.getwch()  # descarta o segundo byte
-                    continue
-                ultima_tecla_silenciosa = False
-                return ch
-            time.sleep(0.05)
-
-    def _ler_tecla_linux(self):
-        """Lê uma tecla no Linux via termios/tty/select."""
-        global ultima_tecla_silenciosa
-        while True:
-            try:
-                item = fila_teclas_voz.get_nowait()
-                return _normalizar_item_fila_voz(item)
-            except queue.Empty:
-                pass
-
-            prontos, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if prontos:
-                ultima_tecla_silenciosa = False
-                return sys.stdin.read(1)
+        # O terminal só volta ao normal quando o programa termina.
+        self.ativo = False
 
     def ler_tecla(self):
         """
@@ -1276,9 +1668,74 @@ class LeitorTeclado:
         do reconhecimento de voz (quando o microfone está ativo),
         o que chegar primeiro.
         """
-        if WINDOWS:
-            return self._ler_tecla_windows()
-        return self._ler_tecla_linux()
+        return proxima_tecla()
+
+
+AJUDA_TECLAS = (
+    "Teclas disponíveis a qualquer momento. "
+    "Escape corta a fala. "
+    "Tecla A aumenta a velocidade da voz. Tecla D diminui. "
+    "Tecla M liga ou desliga o microfone. "
+    "Tecla F liga ou desliga o modo fone. "
+    "Tecla H repete esta ajuda."
+)
+
+
+def ajustar_velocidade(direcao):
+    """direcao > 0 acelera a voz; direcao < 0 deixa a voz mais lenta."""
+    global velocidade_voz
+    if SynthesisConfig is None:
+        falar_interrompendo(
+            "Esta versão do Piper não permite mudar a velocidade.", imprimir=True
+        )
+        return
+
+    with lock_velocidade:
+        antiga = velocidade_voz
+        nova = antiga + direcao * PASSO_VELOCIDADE
+        nova = round(min(VELOCIDADE_MAX, max(VELOCIDADE_MIN, nova)), 2)
+        velocidade_voz = nova
+
+    if nova != antiga:
+        mensagem = "Mais rápido." if direcao > 0 else "Mais devagar."
+    else:
+        mensagem = "Velocidade máxima." if direcao > 0 else "Velocidade mínima."
+    print(f"\n[VOZ] Velocidade: {nova:.2f}x")
+    falar_interrompendo(mensagem)
+
+
+def falar_ajuda():
+    with lock_modo_fone:
+        fone = "ativado" if modo_fone else "desativado"
+    print()
+    print("Teclas: [Esc] corta a fala | [A] voz mais rápida | [D] voz mais lenta | "
+          "[M] microfone | [F] modo fone | [H] esta ajuda")
+    falar_interrompendo(
+        AJUDA_TECLAS
+        + f" Microfone {texto_status_microfone_falado()}. Modo fone {fone}."
+    )
+
+
+def tratar_tecla_global(tecla):
+    """
+    Teclas que valem em qualquer tela (menus e digitação).
+    Retorna True quando a tecla foi tratada aqui.
+    """
+    if tecla in ("m", "M"):
+        alternar_microfone()
+    elif tecla in ("f", "F"):
+        alternar_modo_fone()
+    elif tecla in ("a", "A"):
+        ajustar_velocidade(+1)
+    elif tecla in ("d", "D"):
+        ajustar_velocidade(-1)
+    elif tecla in ("h", "H"):
+        falar_ajuda()
+    elif tecla == "\x1b":
+        cortar_fala()
+    else:
+        return False
+    return True
 
 
 def ler_tecla_menu():
@@ -1287,11 +1744,9 @@ def ler_tecla_menu():
         leitor.iniciar()
         while True:
             tecla = leitor.ler_tecla()
-            if tecla in ("m", "M"):
-                alternar_microfone()
-                continue
-            if tecla in ("f", "F"):
-                alternar_modo_fone()
+            if tecla == "\x03":
+                raise KeyboardInterrupt
+            if tratar_tecla_global(tecla):
                 continue
             return tecla
     finally:
@@ -1303,9 +1758,65 @@ def validar_token_numero(token):
     if token in ("", "-", "."):
         return None
     try:
-        return float(token)
+        valor = float(token)
     except ValueError:
         return None
+    # Mais de 308 dígitos vira infinito, que não dá para analisar.
+    return valor if np.isfinite(valor) else None
+
+
+def aplicar_tecla(texto, tecla, em_linha):
+    """
+    Aplica uma tecla de edição ao texto que está sendo digitado.
+    em_linha=True: linha da matriz (vários elementos separados por espaço).
+    em_linha=False: um único número.
+
+    Devolve (novo_texto, tela, fala):
+      tela = o que escrever no terminal ("\b \b" apaga um caractere);
+      fala = o que dizer (None se nada). Teclas vindas da voz não falam.
+    """
+    if tecla in ("\x7f", "\b"):
+        if texto:
+            return texto[:-1], "\b \b", "apagado"
+        return texto, "", "Não há nada para apagar."
+
+    if tecla == " " and em_linha:
+        if texto and not texto.endswith(" "):
+            return texto + " ", " ", "espaço"
+        return texto, "", ("Já há um espaço." if texto else "Digite primeiro um número.")
+
+    if tecla in DIGITOS:
+        return texto + tecla, tecla, DIGITOS[tecla]
+
+    # Elemento em edição (a linha inteira, no modo de um número só).
+    atual = texto.split(" ")[-1] if em_linha else texto
+
+    if tecla == "-":
+        if atual == "":
+            return texto + "-", "-", "menos"
+        if em_linha:
+            return texto, "", "O sinal de menos deve estar no início do elemento."
+        return texto, "", "Tecla não permitida."
+
+    if tecla in (".", ","):
+        tem_digito = any(c in DIGITOS for c in atual)
+        tem_separador = "." in atual or "," in atual
+        if tem_digito and not tem_separador:
+            return texto + tecla, tecla, "vírgula"
+        if em_linha:
+            if not tem_digito:
+                return texto, "", "Digite primeiro um número."
+            return texto, "", "Este elemento já possui separador decimal."
+        if tem_separador:
+            return texto, "", "O número já possui separador decimal."
+
+    return texto, "", "Tecla não permitida."
+
+
+def escrever_na_tela(trecho):
+    if trecho:
+        sys.stdout.write(trecho)
+        sys.stdout.flush()
 
 
 def ler_linha_matriz(numero_linha, quantidade_colunas):
@@ -1316,10 +1827,9 @@ def ler_linha_matriz(numero_linha, quantidade_colunas):
         print(f"(Microfone: {texto_status_microfone()} — pressione M para alternar)")
         print("> ", end="", flush=True)
 
-        falar_somente(
-            f"Linha {numero_linha}. Digite os elementos separados por espaços."
-        )
-        esperar_voz()
+        # Não espera a fala terminar: o teclado já está sendo lido e a
+        # primeira tecla digitada corta o aviso.
+        falar_somente(f"Linha {numero_linha}.")
 
         leitor = LeitorTeclado()
         texto = ""
@@ -1332,8 +1842,7 @@ def ler_linha_matriz(numero_linha, quantidade_colunas):
                 if tecla == "\x03":
                     raise KeyboardInterrupt
 
-                if tecla in ("m", "M"):
-                    alternar_microfone()
+                if tratar_tecla_global(tecla):
                     continue
 
                 if tecla in ("\r", "\n"):
@@ -1343,16 +1852,17 @@ def ler_linha_matriz(numero_linha, quantidade_colunas):
                     if len(tokens) != quantidade_colunas:
                         if len(tokens) < quantidade_colunas:
                             diferenca = quantidade_colunas - len(tokens)
-                            falar_interrompendo(
-                                f"Você informou {len(tokens)} elementos. "
-                                f"Faltam {diferenca}."
-                            )
+                            if diferenca == 1:
+                                mensagem = "Falta 1 elemento."
+                            else:
+                                mensagem = f"Faltam {diferenca} elementos."
                         else:
                             diferenca = len(tokens) - quantidade_colunas
-                            falar_interrompendo(
-                                f"Você informou {len(tokens)} elementos. "
-                                f"Há {diferenca} elementos a mais."
-                            )
+                            if diferenca == 1:
+                                mensagem = "Há 1 elemento a mais."
+                            else:
+                                mensagem = f"Há {diferenca} elementos a mais."
+                        falar_interrompendo(mensagem, imprimir=True)
                         break
 
                     valores = []
@@ -1363,6 +1873,7 @@ def ler_linha_matriz(numero_linha, quantidade_colunas):
                             falar_interrompendo(
                                 f"O valor {token} não é um número válido."
                             )
+                            print(f"O valor {token} não é um número válido.")
                             invalido = True
                             break
                         valores.append(valor)
@@ -1372,71 +1883,15 @@ def ler_linha_matriz(numero_linha, quantidade_colunas):
 
                     return valores
 
-                if tecla in ("\x7f", "\b"):
-                    if texto:
-                        texto = texto[:-1]
-                        sys.stdout.write("\b \b")
-                        sys.stdout.flush()
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("apagado")
-                    else:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("Não há nada para apagar.")
-                    continue
-
-                if tecla == " ":
-                    if texto and not texto.endswith(" "):
-                        texto += " "
-                        print(" ", end="", flush=True)
-                    continue
-
-                if tecla.isdigit():
-                    texto += tecla
-                    print(tecla, end="", flush=True)
-                    # Teclado físico: fala o dígito. Voz: já leu a frase inteira.
-                    if not ultima_tecla_silenciosa:
-                        falar_interrompendo(DIGITOS[tecla])
-                    continue
-
-                if tecla == "-":
-                    inicio_elemento = not texto or texto.endswith(" ")
-                    if inicio_elemento:
-                        texto += tecla
-                        print("-", end="", flush=True)
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("menos")
-                    else:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo(
-                                "O sinal de menos deve estar no início do elemento."
-                            )
-                    continue
-
-                if tecla in ".,":
-                    tokens = texto.split()
-                    atual = tokens[-1] if tokens else ""
-                    if atual and "." not in atual and "," not in atual:
-                        texto += tecla
-                        print(tecla, end="", flush=True)
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("vírgula")
-                    elif not atual:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("Digite primeiro um número.")
-                    else:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo(
-                                "Este elemento já possui separador decimal."
-                            )
-                    continue
-
-                if not ultima_tecla_silenciosa:
-                    falar_interrompendo("Tecla não permitida.")
+                texto, tela, fala = aplicar_tecla(texto, tecla, em_linha=True)
+                escrever_na_tela(tela)
+                if fala and not ultima_tecla_silenciosa:
+                    falar_interrompendo(fala)
         finally:
             leitor.restaurar()
 
 
-def ler_numero_tempo_real(mensagem):
+def ler_numero_tempo_real(mensagem, falado=None):
     while True:
         leitor = LeitorTeclado()
         valor_digitado = ""
@@ -1444,17 +1899,16 @@ def ler_numero_tempo_real(mensagem):
         print(mensagem)
         print(f"(Microfone: {texto_status_microfone()} — pressione M para alternar)")
         print("> ", end="", flush=True)
-        falar_interrompendo(mensagem)
+        leitor.iniciar()
+        falar_interrompendo(falado or mensagem)
         try:
-            leitor.iniciar()
             while True:
                 tecla = leitor.ler_tecla()
 
                 if tecla == "\x03":
                     raise KeyboardInterrupt
 
-                if tecla in ("m", "M"):
-                    alternar_microfone()
+                if tratar_tecla_global(tecla):
                     continue
 
                 if tecla in ("\r", "\n"):
@@ -1466,88 +1920,47 @@ def ler_numero_tempo_real(mensagem):
                     print()
                     return valor
 
-                if tecla in ("\x7f", "\b"):
-                    if valor_digitado:
-                        valor_digitado = valor_digitado[:-1]
-                        sys.stdout.write("\b \b")
-                        sys.stdout.flush()
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("apagado")
-                    else:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("Não há nada para apagar.")
-                    continue
-
-                if tecla.isdigit():
-                    valor_digitado += tecla
-                    print(tecla, end="", flush=True)
-                    if not ultima_tecla_silenciosa:
-                        falar_interrompendo(DIGITOS[tecla])
-                    continue
-
-                if tecla == "-" and valor_digitado == "":
-                    valor_digitado += tecla
-                    print("-", end="", flush=True)
-                    if not ultima_tecla_silenciosa:
-                        falar_interrompendo("menos")
-                    continue
-
-                if tecla in ".," and valor_digitado not in ("", "-"):
-                    if "." not in valor_digitado and "," not in valor_digitado:
-                        valor_digitado += tecla
-                        print(tecla, end="", flush=True)
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo("vírgula")
-                    else:
-                        if not ultima_tecla_silenciosa:
-                            falar_interrompendo(
-                                "O número já possui separador decimal."
-                            )
-                    continue
-
-                if not ultima_tecla_silenciosa:
-                    falar_interrompendo("Tecla não permitida.")
+                valor_digitado, tela, fala = aplicar_tecla(valor_digitado, tecla, em_linha=False)
+                escrever_na_tela(tela)
+                if fala and not ultima_tecla_silenciosa:
+                    falar_interrompendo(fala)
         finally:
             leitor.restaurar()
 
 
 def ler_inteiro_positivo(mensagem):
+    falado = mensagem
     while True:
-        valor = ler_numero_tempo_real(mensagem)
+        valor = ler_numero_tempo_real(mensagem, falado)
         if valor > 0 and float(valor).is_integer():
             return int(valor)
-        falar_interrompendo("Digite um número inteiro maior que zero.")
+        falado = "Digite um número inteiro maior que zero."
 
 
-def informar_matriz(anunciar=True):
+def informar_matriz():
     """
     Pergunta linhas, colunas e cada linha da matriz.
     Atualiza ULTIMA_MATRIZ com o resultado, para que outras
     partes do programa possam reaproveitar a transposta dela.
     """
-    global ULTIMA_MATRIZ
-
-    if anunciar:
-        falar("Vamos informar uma nova matriz.")
+    global ULTIMA_MATRIZ, INSTRUCOES_MATRIZ_FALADAS
 
     linhas = ler_inteiro_positivo("Digite o número de linhas.")
     colunas = ler_inteiro_positivo("Digite o número de colunas.")
 
-    falar_somente(
-        f"A matriz possui {linhas} linhas e {colunas} colunas."
-    )
-
     print()
+    print(f"A matriz possui {linhas} linhas e {colunas} colunas.")
     print("Digite uma linha inteira por vez.")
     print("Use espaços para separar os elementos.")
     print("Exemplo: 1 2 3")
 
-    falar_somente(
-        "Digite uma linha inteira por vez. "
-        "Use espaços para separar os elementos. "
-        "Por exemplo: um, espaço, dois, espaço, três."
-    )
-    esperar_voz()
+    # A explicação completa só é falada na primeira matriz da sessão.
+    if not INSTRUCOES_MATRIZ_FALADAS:
+        INSTRUCOES_MATRIZ_FALADAS = True
+        falar_interrompendo(
+            "Digite uma linha por vez, separando os elementos com espaço. "
+            "Por exemplo: um, espaço, dois, espaço, três."
+        )
 
     matriz = []
     for i in range(linhas):
@@ -1556,10 +1969,23 @@ def informar_matriz(anunciar=True):
     resultado = np.array(matriz, dtype=float)
     print()
     print("Matriz preenchida.")
-    falar("Matriz preenchida.")
 
     ULTIMA_MATRIZ = resultado
     return resultado
+
+
+# Tolerância das comparações. Os elementos são números digitados e as
+# comparações estruturais (simetria, diagonal...) não fazem contas, então a
+# tolerância relativa é minúscula: com a padrão do NumPy (1e-5), 100000 e
+# 100000,5 seriam considerados iguais.
+TOL_ABS = 1e-8
+TOL_REL = 1e-12
+
+
+def _iguais(a, b):
+    # Diferenças enormes podem estourar o float (vira infinito = "diferente").
+    with np.errstate(over="ignore", invalid="ignore"):
+        return bool(np.allclose(a, b, rtol=TOL_REL, atol=TOL_ABS))
 
 
 def eh_quadrada(matriz):
@@ -1571,7 +1997,7 @@ def eh_retangular(matriz):
 
 
 def eh_nula(matriz):
-    return np.allclose(matriz, 0)
+    return _iguais(matriz, 0)
 
 
 def eh_coluna(matriz):
@@ -1583,38 +2009,59 @@ def eh_linha(matriz):
 
 
 def eh_diagonal(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz, np.diag(np.diag(matriz)))
+    return eh_quadrada(matriz) and _iguais(matriz, np.diag(np.diag(matriz)))
 
 
 def eh_escalar(matriz):
     if not eh_diagonal(matriz):
         return False
     diagonal = np.diag(matriz)
-    return np.allclose(diagonal, diagonal[0])
+    return _iguais(diagonal, diagonal[0])
 
 
 def eh_identidade(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz, np.eye(matriz.shape[0]))
+    return eh_quadrada(matriz) and _iguais(matriz, np.eye(matriz.shape[0]))
 
 
 def eh_triangular_superior(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz, np.triu(matriz))
+    return eh_quadrada(matriz) and _iguais(matriz, np.triu(matriz))
 
 
 def eh_triangular_inferior(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz, np.tril(matriz))
+    return eh_quadrada(matriz) and _iguais(matriz, np.tril(matriz))
 
 
 def eh_simetrica(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz, matriz.T)
+    return eh_quadrada(matriz) and _iguais(matriz, matriz.T)
 
 
 def eh_antissimetrica(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz.T, -matriz)
+    return eh_quadrada(matriz) and _iguais(matriz.T, -matriz)
 
 
 def eh_normal(matriz):
-    return eh_quadrada(matriz) and np.allclose(matriz @ matriz.T, matriz.T @ matriz)
+    """
+    Matriz normal (real): A @ A.T == A.T @ A.
+
+    Com elementos inteiros a conta é feita em inteiros do Python, sem erro
+    de arredondamento. Com decimais, a tolerância acompanha a precisão do
+    ponto flutuante e o tamanho dos elementos (uma tolerância fixa aceitaria
+    como normal, por exemplo, [[1000, 1], [0, 1000]]).
+    """
+    if not eh_quadrada(matriz) or not np.all(np.isfinite(matriz)):
+        return False
+
+    if np.array_equal(matriz, np.round(matriz)):
+        inteira = np.array([[int(v) for v in linha] for linha in matriz], dtype=object)
+        return bool(np.all(inteira @ inteira.T == inteira.T @ inteira))
+
+    n = matriz.shape[0]
+    maior = float(np.max(np.abs(matriz)))
+    tolerancia = TOL_ABS + 64 * np.finfo(float).eps * n * maior * maior
+    with np.errstate(over="ignore", invalid="ignore"):
+        produto_1 = matriz @ matriz.T
+        produto_2 = matriz.T @ matriz
+    return bool(np.allclose(produto_1, produto_2, rtol=0, atol=tolerancia))
 
 
 def matriz_para_fala(matriz):
@@ -1624,14 +2071,15 @@ def matriz_para_fala(matriz):
     return ". ".join(linhas)
 
 
-def mostrar_matriz(matriz, titulo):
+def mostrar_matriz(matriz, titulo, falar_matriz=True):
     print()
     print("=" * LARGURA)
     print(titulo)
     print("=" * LARGURA)
     for linha in matriz:
         print(" ".join(numero_para_texto(valor) for valor in linha))
-    falar_somente(f"{titulo}. {matriz_para_fala(matriz)}.")
+    if falar_matriz:
+        falar_somente(f"{titulo}. {matriz_para_fala(matriz)}.")
 
 
 def imprimir_classificacao(numero, nome, resultado, explicacao):
@@ -1650,10 +2098,96 @@ def imprimir_classificacao(numero, nome, resultado, explicacao):
 # ANÁLISE PRINCIPAL — ITENS 1 A 11
 # ============================================================
 
+# (número, nome, teste, explicação se SIM, explicação se NÃO)
+EXPLICACAO_UNIDADE = (
+    "Neste programa, matriz unidade é tratada como sinônimo de matriz identidade."
+)
+CLASSIFICACOES_ANALISE = [
+    (1, "Matriz quadrada", eh_quadrada,
+     "O número de linhas é igual ao número de colunas.",
+     "O número de linhas é diferente do número de colunas."),
+    (2, "Matriz retangular", eh_retangular,
+     "O número de linhas é diferente do número de colunas.",
+     "A matriz é quadrada."),
+    (3, "Matriz nula ou zero", eh_nula,
+     "Todos os elementos são iguais a zero.",
+     "Existe pelo menos um elemento diferente de zero."),
+    (4, "Matriz coluna", eh_coluna,
+     "A matriz possui exatamente uma coluna.",
+     "A matriz possui mais de uma coluna."),
+    (5, "Matriz linha", eh_linha,
+     "A matriz possui exatamente uma linha.",
+     "A matriz possui mais de uma linha."),
+    (6, "Matriz diagonal", eh_diagonal,
+     "A matriz é quadrada e todos os elementos fora da diagonal principal são zero.",
+     "Existe pelo menos um elemento fora da diagonal principal diferente de zero."),
+    (7, "Matriz escalar", eh_escalar,
+     "A matriz é diagonal e todos os elementos da diagonal principal são iguais.",
+     "A matriz não é diagonal ou os elementos da diagonal principal não são todos iguais."),
+    (8, "Matriz identidade", eh_identidade,
+     "A diagonal principal contém somente um e os demais elementos são zero.",
+     "A matriz não possui a forma da identidade."),
+    (9, "Matriz unidade", eh_identidade,
+     EXPLICACAO_UNIDADE, EXPLICACAO_UNIDADE),
+    (10, "Matriz triangular superior", eh_triangular_superior,
+     "Todos os elementos abaixo da diagonal principal são zero.",
+     "Existe elemento diferente de zero abaixo da diagonal principal."),
+    (11, "Matriz triangular inferior", eh_triangular_inferior,
+     "Todos os elementos acima da diagonal principal são zero.",
+     "Existe elemento diferente de zero acima da diagonal principal."),
+]
+
+CLASSIFICACOES_TRANSPOSTA = [
+    (13, "Matriz simétrica", eh_simetrica,
+     "A matriz é igual à sua transposta.",
+     "A matriz é diferente da sua transposta."),
+    (14, "Matriz antissimétrica", eh_antissimetrica,
+     "A transposta da matriz é igual ao negativo da matriz.",
+     "A transposta da matriz não é igual ao seu negativo."),
+]
+
+CLASSIFICACAO_NORMAL = (
+    15, "Matriz normal", eh_normal,
+    "A matriz vezes sua transposta é igual à transposta vezes a matriz.",
+    "Os dois produtos, M vezes M transposta e M transposta vezes M, são diferentes.",
+)
+
+
+def aplicar_classificacoes(matriz, tabela):
+    """
+    Roda cada teste da tabela, imprime e fala o resultado e devolve
+    os nomes das classificações que deram SIM.
+    """
+    encontradas = []
+    for numero, nome, teste, se_sim, se_nao in tabela:
+        if teste(matriz):
+            encontradas.append(nome)
+            imprimir_classificacao(numero, nome, "SIM", se_sim)
+        else:
+            imprimir_classificacao(numero, nome, "NÃO", se_nao)
+    return encontradas
+
+
+def mostrar_resumo(classificacoes, titulo, texto_vazio):
+    print()
+    print("=" * LARGURA)
+    print(titulo)
+    print("=" * LARGURA)
+
+    if classificacoes:
+        for i, nome in enumerate(classificacoes, 1):
+            print(f"{i}. {nome}")
+        falar_somente(
+            "Classificações encontradas: " + ", ".join(classificacoes) + "."
+        )
+    else:
+        print(texto_vazio)
+        falar_somente(texto_vazio)
+
+
 def analisar_matriz(matriz):
     iniciar_captura_audio()
 
-    classificacoes = []
     linhas, colunas = matriz.shape
 
     print()
@@ -1661,136 +2195,22 @@ def analisar_matriz(matriz):
     print("ANÁLISE DA MATRIZ (classificações 1 a 11)")
     print("=" * LARGURA)
 
-    falar("A análise da matriz começou.")
     falar_somente(f"A matriz possui {linhas} linhas e {colunas} colunas.")
     mostrar_matriz(matriz, "Matriz informada")
 
-    if eh_quadrada(matriz):
-        classificacoes.append("Matriz quadrada")
-        imprimir_classificacao(1, "Matriz quadrada", "SIM",
-            "O número de linhas é igual ao número de colunas.")
-    else:
-        imprimir_classificacao(1, "Matriz quadrada", "NÃO",
-            "O número de linhas é diferente do número de colunas.")
+    classificacoes = aplicar_classificacoes(matriz, CLASSIFICACOES_ANALISE)
 
-    if eh_retangular(matriz):
-        classificacoes.append("Matriz retangular")
-        imprimir_classificacao(2, "Matriz retangular", "SIM",
-            "O número de linhas é diferente do número de colunas.")
-    else:
-        imprimir_classificacao(2, "Matriz retangular", "NÃO",
-            "A matriz é quadrada.")
-
-    if eh_nula(matriz):
-        classificacoes.append("Matriz nula ou zero")
-        imprimir_classificacao(3, "Matriz nula ou zero", "SIM",
-            "Todos os elementos são iguais a zero.")
-    else:
-        imprimir_classificacao(3, "Matriz nula ou zero", "NÃO",
-            "Existe pelo menos um elemento diferente de zero.")
-
-    if eh_coluna(matriz):
-        classificacoes.append("Matriz coluna")
-        imprimir_classificacao(4, "Matriz coluna", "SIM",
-            "A matriz possui exatamente uma coluna.")
-    else:
-        imprimir_classificacao(4, "Matriz coluna", "NÃO",
-            "A matriz possui mais de uma coluna.")
-
-    if eh_linha(matriz):
-        classificacoes.append("Matriz linha")
-        imprimir_classificacao(5, "Matriz linha", "SIM",
-            "A matriz possui exatamente uma linha.")
-    else:
-        imprimir_classificacao(5, "Matriz linha", "NÃO",
-            "A matriz possui mais de uma linha.")
-
-    if eh_diagonal(matriz):
-        classificacoes.append("Matriz diagonal")
-        imprimir_classificacao(6, "Matriz diagonal", "SIM",
-            "A matriz é quadrada e todos os elementos fora da diagonal principal são zero.")
-    else:
-        imprimir_classificacao(6, "Matriz diagonal", "NÃO",
-            "Existe pelo menos um elemento fora da diagonal principal diferente de zero.")
-
-    if eh_escalar(matriz):
-        classificacoes.append("Matriz escalar")
-        imprimir_classificacao(7, "Matriz escalar", "SIM",
-            "A matriz é diagonal e todos os elementos da diagonal principal são iguais.")
-    else:
-        imprimir_classificacao(7, "Matriz escalar", "NÃO",
-            "A matriz não é diagonal ou os elementos da diagonal principal não são todos iguais.")
-
-    matriz_e_identidade = eh_identidade(matriz)
-
-    if matriz_e_identidade:
-        classificacoes.append("Matriz identidade")
-        imprimir_classificacao(8, "Matriz identidade", "SIM",
-            "A diagonal principal contém somente um e os demais elementos são zero.")
-    else:
-        imprimir_classificacao(8, "Matriz identidade", "NÃO",
-            "A matriz não possui a forma da identidade.")
-
-    if matriz_e_identidade:
-        classificacoes.append("Matriz unidade")
-        imprimir_classificacao(9, "Matriz unidade", "SIM",
-            "Neste programa, matriz unidade é tratada como sinônimo de matriz identidade.")
-    else:
-        imprimir_classificacao(9, "Matriz unidade", "NÃO",
-            "Neste programa, matriz unidade é tratada como sinônimo de matriz identidade.")
-
-    if eh_triangular_superior(matriz):
-        classificacoes.append("Matriz triangular superior")
-        imprimir_classificacao(10, "Matriz triangular superior", "SIM",
-            "Todos os elementos abaixo da diagonal principal são zero.")
-    else:
-        imprimir_classificacao(10, "Matriz triangular superior", "NÃO",
-            "Existe elemento diferente de zero abaixo da diagonal principal.")
-
-    if eh_triangular_inferior(matriz):
-        classificacoes.append("Matriz triangular inferior")
-        imprimir_classificacao(11, "Matriz triangular inferior", "SIM",
-            "Todos os elementos acima da diagonal principal são zero.")
-    else:
-        imprimir_classificacao(11, "Matriz triangular inferior", "NÃO",
-            "Existe elemento diferente de zero acima da diagonal principal.")
-
-    print()
-    print("=" * LARGURA)
-    print("RESUMO (classificações 1 a 11)")
-    print("=" * LARGURA)
-
-    if classificacoes:
-        for i, nome in enumerate(classificacoes, 1):
-            print(f"{i}. {nome}")
-    else:
-        print("Nenhuma classificação aplicável.")
-
-    falar_somente(
-        f"Foram encontradas {len(classificacoes)} classificações aplicáveis."
+    mostrar_resumo(
+        classificacoes,
+        "RESUMO (classificações 1 a 11)",
+        "Nenhuma classificação aplicável.",
     )
-
-    if classificacoes:
-        falar_somente(
-            "As classificações encontradas foram: "
-            + ", ".join(classificacoes)
-            + "."
-        )
 
     print()
     print("Dica: use o menu 'Transformar matriz' para calcular a "
           "transposta e verificar simetria, antissimetria e normalidade.")
 
-    falar(
-        "Dica: use o menu Transformar matriz para calcular a transposta "
-        "e verificar simetria, antissimetria e normalidade."
-    )
-    esperar_voz()
-
-    falar("Análise concluída.")
-
     parar_captura_audio()
-    esperar_voz()
 
     oferecer_repeticao_audio()
 
@@ -1811,8 +2231,6 @@ def transformar_transposta(matriz):
     print("TRANSFORMAÇÃO: TRANSPOSTA E CLASSIFICAÇÕES RELACIONADAS")
     print("=" * LARGURA)
 
-    falar("Calculando a transposta e as classificações relacionadas.")
-
     mostrar_matriz(matriz, "Matriz original")
 
     transposta = matriz.T
@@ -1824,38 +2242,15 @@ def transformar_transposta(matriz):
         "Ela é obtida trocando as linhas pelas colunas."
     )
 
-    classificacoes = []
-
-    if eh_simetrica(matriz):
-        classificacoes.append("Matriz simétrica")
-        imprimir_classificacao(13, "Matriz simétrica", "SIM",
-            "A matriz é igual à sua transposta.")
-    else:
-        imprimir_classificacao(13, "Matriz simétrica", "NÃO",
-            "A matriz é diferente da sua transposta.")
-
-    if eh_antissimetrica(matriz):
-        classificacoes.append("Matriz antissimétrica")
-        imprimir_classificacao(14, "Matriz antissimétrica", "SIM",
-            "A transposta da matriz é igual ao negativo da matriz.")
-    else:
-        imprimir_classificacao(14, "Matriz antissimétrica", "NÃO",
-            "A transposta da matriz não é igual ao seu negativo.")
+    classificacoes = aplicar_classificacoes(matriz, CLASSIFICACOES_TRANSPOSTA)
 
     if eh_quadrada(matriz):
-        produto_1 = matriz @ matriz.T
-        produto_2 = matriz.T @ matriz
-
+        with np.errstate(over="ignore", invalid="ignore"):
+            produto_1 = matriz @ matriz.T
+            produto_2 = matriz.T @ matriz
         mostrar_matriz(produto_1, "M vezes M transposta")
         mostrar_matriz(produto_2, "M transposta vezes M")
-
-        if eh_normal(matriz):
-            classificacoes.append("Matriz normal")
-            imprimir_classificacao(15, "Matriz normal", "SIM",
-                "A matriz vezes sua transposta é igual à transposta vezes a matriz.")
-        else:
-            imprimir_classificacao(15, "Matriz normal", "NÃO",
-                "Os dois produtos, M vezes M transposta e M transposta vezes M, são diferentes.")
+        classificacoes += aplicar_classificacoes(matriz, [CLASSIFICACAO_NORMAL])
     else:
         print("15. Matriz normal: NÃO SE APLICA")
         print("    A verificação de normalidade exige uma matriz quadrada.")
@@ -1864,27 +2259,13 @@ def transformar_transposta(matriz):
             "A verificação de normalidade exige uma matriz quadrada."
         )
 
-    print()
-    print("=" * LARGURA)
-    print("RESUMO (classificações relacionadas à transposta)")
-    print("=" * LARGURA)
-
-    if classificacoes:
-        for i, nome in enumerate(classificacoes, 1):
-            print(f"{i}. {nome}")
-        falar_somente(
-            "As classificações encontradas foram: "
-            + ", ".join(classificacoes)
-            + "."
-        )
-    else:
-        print("Nenhuma classificação adicional aplicável.")
-        falar_somente("Nenhuma classificação adicional aplicável.")
-
-    falar("Cálculo da transposta concluído.")
+    mostrar_resumo(
+        classificacoes,
+        "RESUMO (classificações relacionadas à transposta)",
+        "Nenhuma classificação adicional aplicável.",
+    )
 
     parar_captura_audio()
-    esperar_voz()
 
     oferecer_repeticao_audio()
 
@@ -1917,31 +2298,28 @@ def linha_fina():
 # ============================================================
 
 def menu_transformar():
+    anunciar = True
     while True:
-        limpar_tela()
-        caixa_titulo("TRANSFORMAR MATRIZ")
-        item_menu("1", "Calcular transposta (inclui simetria, antissimetria e normalidade)")
-        item_menu("2", "Voltar")
-        linha_fina()
-
-        falar_somente(
-            "Menu de transformações. "
-            "Um para calcular a transposta e verificar simetria, "
-            "antissimetria e normalidade. "
-            "Dois para voltar."
-        )
+        if anunciar:
+            limpar_tela()
+            caixa_titulo("TRANSFORMAR MATRIZ")
+            item_menu("1", "Calcular transposta (inclui simetria, antissimetria e normalidade)")
+            item_menu("2", "Voltar")
+            linha_fina()
+            falar_interrompendo(
+                "Um, transposta e classificações relacionadas. Dois, voltar."
+            )
+        anunciar = True
 
         tecla = ler_tecla_menu()
 
         if tecla == "1":
-            falar_interrompendo("Você escolheu calcular a transposta.", imprimir=True)
-            esperar_voz()
             transformar_transposta(informar_matriz())
         elif tecla == "2":
-            falar_interrompendo("Voltando ao menu principal.", imprimir=True)
             return
         else:
             falar_interrompendo("Opção inválida. Escolha um ou dois.", imprimir=True)
+            anunciar = False
 
 
 def menu_informar_analisar():
@@ -1957,96 +2335,90 @@ def menu_informar_analisar():
         analisar_matriz(matriz)
         return
 
+    anunciar = True
     while True:
-        limpar_tela()
-        caixa_titulo("INFORMAR MATRIZ")
-        item_menu("1", "Informar nova matriz")
-        item_menu("2", "Usar a transposta da última matriz informada")
-        item_menu("3", "Voltar")
-
-        falar_somente(
-            "Um para informar uma nova matriz. "
-            "Dois para usar a transposta da última matriz informada. "
-            "Três para voltar."
-        )
+        if anunciar:
+            limpar_tela()
+            caixa_titulo("INFORMAR MATRIZ")
+            item_menu("1", "Informar nova matriz")
+            item_menu("2", "Usar a transposta da última matriz informada")
+            item_menu("3", "Voltar")
+            falar_interrompendo(
+                "Um, nova matriz. Dois, transposta da última matriz. Três, voltar."
+            )
+        anunciar = True
 
         tecla = ler_tecla_menu()
 
         if tecla == "1":
-            falar_interrompendo("Você escolheu informar uma nova matriz.", imprimir=True)
-            esperar_voz()
             matriz = informar_matriz()
             analisar_matriz(matriz)
             return
 
         elif tecla == "2":
-            falar_interrompendo(
-                "Você escolheu usar a transposta da última matriz informada.",
-                imprimir=True
-            )
-            esperar_voz()
             matriz = ULTIMA_MATRIZ.T
-            mostrar_matriz(matriz, "Matriz transposta utilizada como nova matriz")
+            mostrar_matriz(
+                matriz, "Matriz transposta utilizada como nova matriz",
+                falar_matriz=False
+            )
             ULTIMA_MATRIZ = matriz
+            falar_somente("Usando a transposta.")
             analisar_matriz(matriz)
             return
 
         elif tecla == "3":
-            falar_interrompendo("Voltando ao menu principal.", imprimir=True)
             return
 
         else:
             falar_interrompendo(
                 "Opção inválida. Escolha um, dois ou três.", imprimir=True
             )
+            anunciar = False
 
 
 def menu():
+    anunciar = True
     while True:
-        limpar_tela()
-        caixa_titulo("CLASSIFICADOR AUTOMÁTICO DE MATRIZES")
-        item_menu("1", "Informar matriz e analisar (classificações 1 a 11)")
-        item_menu("2", "Transformar matriz (transposta, simetria, normalidade)")
-        item_menu("3", "Sair")
-        with lock_modo_fone:
-            fone_txt = "ATIVADO" if modo_fone else "DESATIVADO"
-        print(f"  Microfone: {texto_status_microfone()}   [M] alternar")
-        print(f"  Modo fone: {fone_txt}   aperte [F] ou [Fale 'Fone'] para alternar (sem eco durante a voz)")
-        linha_fina()
+        if anunciar:
+            limpar_tela()
+            caixa_titulo("CLASSIFICADOR AUTOMÁTICO DE MATRIZES")
+            item_menu("1", "Informar matriz e analisar (classificações 1 a 11)")
+            item_menu("2", "Transformar matriz (transposta, simetria, normalidade)")
+            item_menu("3", "Sair")
+            with lock_modo_fone:
+                fone_txt = "ATIVADO" if modo_fone else "DESATIVADO"
+            with lock_velocidade:
+                velocidade_txt = velocidade_voz
+            print(f"  Microfone: {texto_status_microfone()}   [M] alternar")
+            print(f"  Modo fone: {fone_txt}   aperte [F] ou [Fale 'Fone'] para alternar (sem eco durante a voz)")
+            print(f"  Velocidade da voz: {velocidade_txt:.2f}x   [A] aumentar   [D] diminuir")
+            print("  [Esc] corta a fala   [H] ajuda com as teclas")
+            linha_fina()
 
-        falar_somente(
-            "Menu principal. "
-            "Um para informar e analisar uma matriz. "
-            "Dois para transformar uma matriz. "
-            "Três para sair. "
-            f"Microfone {texto_status_microfone_falado()}. "
-            "Pressione M a qualquer momento para ativar ou desativar o microfone. "
-            f"Modo fone {fone_txt}. "
-            "Pressione F ou fale 'Fone' em qualquer momento para alternar o modo fone."
-        )
+            falar_interrompendo(
+                "Menu principal. "
+                "Um, informar e analisar matriz. "
+                "Dois, transformar matriz. "
+                "Três, sair. "
+                "H para ajuda."
+            )
+        anunciar = True
 
         tecla = ler_tecla_menu()
 
         if tecla == "1":
-            falar_interrompendo(
-                "Você escolheu informar e analisar uma matriz.", imprimir=True
-            )
-            esperar_voz()
             menu_informar_analisar()
         elif tecla == "2":
-            falar_interrompendo(
-                "Você escolheu transformar uma matriz.", imprimir=True
-            )
-            esperar_voz()
             menu_transformar()
         elif tecla == "3":
-            falar_interrompendo("Programa encerrado. Até logo.", imprimir=True)
-            esperar_voz()
+            falar_interrompendo("Até logo.", imprimir=True)
+            esperar_voz_cortavel()
             return
         else:
             falar_interrompendo(
                 "Opção inválida. Pressione um, dois ou três.", imprimir=True
             )
+            anunciar = False
 
 
 def encerrar_voz():
@@ -2064,27 +2436,35 @@ def encerrar_voz():
         pass
 
 
+def _encerrar_por_sinal(numero, quadro):
+    # Vira SystemExit para o finally de main() devolver o terminal ao normal.
+    sys.exit(0)
+
+
 def main():
+    if not WINDOWS:
+        signal.signal(signal.SIGTERM, _encerrar_por_sinal)
+    ligar_terminal_imediato()
     try:
         caixa_titulo("CLASSIFICADOR DE MATRIZES")
-        falar("Bem-vindo ao programa de classificação automática de matrizes.")
-        esperar_voz()
+        falar("Bem-vindo ao classificador de matrizes.")
+        esperar_voz_cortavel()
         if MICROFONE_DISPONIVEL:
             alternar_microfone()
-            esperar_voz()
+            esperar_voz_cortavel()
         else:
             falar_interrompendo(
-                "O reconhecimento por microfone está indisponível. "
-                "O teclado continua funcionando normalmente."
+                "Microfone indisponível. O teclado continua funcionando."
             )
-            esperar_voz()
+            esperar_voz_cortavel()
         menu()
     except KeyboardInterrupt:
         print("\n")
-        falar("Programa interrompido pelo usuário.")
+        falar("Programa interrompido.")
         esperar_voz()
     finally:
         encerrar_voz()
+        desligar_terminal_imediato()
 
 
 if __name__ == "__main__":
